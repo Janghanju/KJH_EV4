@@ -30,6 +30,8 @@
 #define MOTOR_TARGET_REV 20.0    // 방수포 기구부 유효 이동 거리 (20바퀴)
 #define MOTOR_PULSE_DELAY_US 400 // 스텝 모터 기동 주파수 (고속 복귀 세팅)
 
+#define BUTTON_RESET_HOLD_MS 3000 // 상단 원점 강제 복귀를 위한 롱프레스 판정 시간
+
 #define MQ_FIRE_THRESHOLD 1200
 #define TEMP_FIRE_PIXEL 75.0
 #define FIRE_MIN_AREA_PIXELS 12
@@ -54,6 +56,7 @@ adc_oneshot_unit_handle_t adc1_handle;
 int32_t max_target_steps = 0;
 volatile int32_t actual_moved_steps = 0;
 bool stop_requested = false;
+bool needs_position_reset = false; // 화재 복귀가 설정된 20바퀴 미달 시 다음 입력에서 강제 복귀 필요
 
 float mlx90640_frame[32 * 24];
 
@@ -119,6 +122,18 @@ void wait_for_button_release_debounced(void) {
         vTaskDelay(pdMS_TO_TICKS(5));
     }
     vTaskDelay(pdMS_TO_TICKS(20));
+}
+
+// 스위치가 hold_ms 이상 연속으로 눌려있으면 true, 그 전에 떼면 false
+bool is_button_held_long(uint32_t hold_ms) {
+    TickType_t start_tick = xTaskGetTickCount();
+    while (gpio_get_level(PIN_EMERGENCY_SWITCH) == 0) {
+        if ((xTaskGetTickCount() - start_tick) >= pdMS_TO_TICKS(hold_ms)) {
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    return false;
 }
 
 /* =========================================================================
@@ -205,6 +220,9 @@ void vTaskEmergencyMonitor(void *pvParameters) {
 
             move_emergency_return(run_steps);
 
+            needs_position_reset = true; // 화재로 이동한 리프트는 다음 버튼 입력 시 초기 위치로 복귀
+            ESP_LOGW(TAG, "[!] 화재 복귀 이동(%ld 스텝) 완료 -> 다음 버튼 입력 시 초기 위치로 강제 복귀 필요", run_steps);
+
             actual_moved_steps = 0;
             current_state = STATE_READY_REVERSE; // 상단 원점 마킹 고정
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -225,6 +243,19 @@ void vTaskEmergencyMonitor(void *pvParameters) {
         if (!is_fire_detected) {
             if (current_state == STATE_READY_REVERSE) {
                 if (is_button_pressed_debounced()) {
+                    if (needs_position_reset || is_button_held_long(BUTTON_RESET_HOLD_MS)) {
+                        wait_for_button_release_debounced();
+                        ESP_LOGW(TAG, "[⬆ RESET] %s -> 초기 위치(상단 원점)로 강제 복귀",
+                                 needs_position_reset ? "화재 복귀 후 초기화" : "롱프레스 감지");
+
+                        move_forward_return(max_target_steps);
+
+                        actual_moved_steps = 0;
+                        current_state = STATE_READY_REVERSE;
+                        needs_position_reset = false;
+                        continue;
+                    }
+
                     wait_for_button_release_debounced(); // 손을 완전히 뗄 때까지 대기
 
                     gpio_set_level(PIN_COOLING_PUMP, 0);
