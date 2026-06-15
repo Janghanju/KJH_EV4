@@ -1,10 +1,3 @@
-/**
- * @file main.c
- * @brief 차량 고전압 배터리 화재 방재용 [이동식 방수포 수조 제어 X 무제한 순환 냉각 펌프] 통합 시스템
- * @note Core 1: 레이턴시 제로 수준의 리프트 및 펌프 하드웨어 안전 제어
- * Core 0: UART2 포트 기반 GY-MCU90640 리틀 엔디안 패킷 얼라인먼트 및 가스 ADC 분석 연산
- */
-
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_adc/adc_oneshot.h"
@@ -24,8 +17,8 @@
 #define PIN_COOLING_PUMP 8     // [출력] 소화수 펌프/릴레이 제어 핀
 
 #define UART_PORT_NUM UART_NUM_2
-#define PIN_UART_RX 17 // GY-MCU90640 모듈 TX 직결선 (ESP32-S3 RX2)
-#define PIN_UART_TX 18 // GY-MCU90640 모듈 RX 직결선 (ESP32-S3 TX2)
+#define PIN_UART_RX 17 // GY-MCU90640 모듈 TX (ESP32-S3 RX2)
+#define PIN_UART_TX 18 // GY-MCU90640 모듈 RX (ESP32-S3 TX2)
 #define UART_BUF_SIZE 2048
 
 #define ADC_MQ_CHANNEL ADC_CHANNEL_6 // GPIO 7번 (ADC1 단독 사용)
@@ -37,15 +30,14 @@
 #define MOTOR_TARGET_REV 20.0    // 방수포 기구부 유효 이동 거리 (20바퀴)
 #define MOTOR_PULSE_DELAY_US 400 // 스텝 모터 기동 주파수 (고속 복귀 세팅)
 
-// 고전압 배터리 열폭주 전조 단계 특화 하이브리드 판정 임계치
-#define MQ_FIRE_THRESHOLD 1200  // 배터리 셀 오프가스 감지 절대값
-#define TEMP_FIRE_PIXEL 75.0    // 열폭주 의심 단일 격자 온도 기준점 (°C)
-#define FIRE_MIN_AREA_PIXELS 12 // 화재 확정 및 노이즈 차단용 최소 픽셀 면적
+#define MQ_FIRE_THRESHOLD 1200
+#define TEMP_FIRE_PIXEL 75.0
+#define FIRE_MIN_AREA_PIXELS 12
 
 static const char *TAG = "EV_SAFETY_CORE";
 
 typedef enum {
-    STATE_READY_REVERSE, // 상단 원점 대기 상태 (수조 형성 가능 상태)
+    STATE_READY_REVERSE, // 상단 원점 대기 상태
     STATE_READY_FORWARD  // 하단 일반 감시 대기 상태
 } SystemState;
 
@@ -56,21 +48,21 @@ volatile SystemState current_state = STATE_READY_REVERSE;
 volatile int mq_raw_value = 0;
 volatile int high_temp_pixel_count = 0;
 volatile float max_temp = 0.0f;
-volatile bool hybrid_fire_triggered = false; // Core 0 -> Core 1 화재 공유 플래그
+volatile bool hybrid_fire_triggered = false;
 
 adc_oneshot_unit_handle_t adc1_handle;
-int32_t max_target_steps = 0;   // 800 * 20 = 16000 스텝
-int32_t actual_moved_steps = 0; // 하강 시 실제 이동한 거리를 저장 (가변 복귀용)
-bool stop_requested = false;    // 하강 시 중도 멈춤 제어용 플래그
+int32_t max_target_steps = 0;
+volatile int32_t actual_moved_steps = 0;
+bool stop_requested = false;
 
-float mlx90640_frame[32 * 24]; // 768개 픽셀 섭씨 평탄화 온도 배열
+float mlx90640_frame[32 * 24];
 
 /* =========================================================================
  * [4] 하드웨어 및 통신 주변장치 드라이버 초기화
  * ========================================================================= */
 void init_uart_module(void) {
     uart_config_t uart_config = {
-        .baud_rate = 115200, // GY-MCU90640 모듈 고정 통신 속도
+        .baud_rate = 115200,
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
@@ -82,36 +74,30 @@ void init_uart_module(void) {
     ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, PIN_UART_TX, PIN_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    // 모듈 고유 명령어: 실시간 자동 프레임 전송 모드 가동 (3바이트 패킷)
     uint8_t cmd_auto_output[] = {0xA5, 0x15, 0xBA};
     uart_write_bytes(UART_PORT_NUM, (const char *)cmd_auto_output, sizeof(cmd_auto_output));
     ESP_LOGI(TAG, "GY-MCU90640 UART 통신 채널 스트리밍 개시.");
 }
 
 void init_hardware(void) {
-    // 모터 구동 핀 설정
     gpio_reset_pin(PIN_MOTOR_PUL);
     gpio_reset_pin(PIN_MOTOR_DIR);
     gpio_set_direction(PIN_MOTOR_PUL, GPIO_MODE_OUTPUT);
     gpio_set_direction(PIN_MOTOR_DIR, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_MOTOR_PUL, 0);
-    gpio_set_level(PIN_MOTOR_DIR, 0);
+    gpio_set_level(PIN_MOTOR_DIR, 1);
 
-    // 스위치 입력 핀 설정 (디바운싱 내부 풀업 활용)
     gpio_reset_pin(PIN_EMERGENCY_SWITCH);
     gpio_set_direction(PIN_EMERGENCY_SWITCH, GPIO_MODE_INPUT);
     gpio_set_pull_mode(PIN_EMERGENCY_SWITCH, GPIO_PULLUP_ONLY);
 
-    // 펌프 릴레이 핀 설정
     gpio_reset_pin(PIN_COOLING_PUMP);
     gpio_set_direction(PIN_COOLING_PUMP, GPIO_MODE_OUTPUT);
-    gpio_set_level(PIN_COOLING_PUMP, 0); // 초기에는 차단 상태 유지
+    gpio_set_level(PIN_COOLING_PUMP, 0);
 
-    // ADC1 Oneshot 인스턴스 할당
     adc_oneshot_unit_init_cfg_t init_config1 = {.unit_id = ADC_UNIT_1, .clk_src = 0};
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc1_handle));
 
-    // 가스 센서 감도 세팅 (12비트 스케일링, 감쇄량 최대 적용)
     adc_oneshot_chan_cfg_t mq_chan_config = {.bitwidth = ADC_BITWIDTH_12, .atten = ADC_ATTEN_DB_12};
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_MQ_CHANNEL, &mq_chan_config));
 
@@ -119,7 +105,15 @@ void init_hardware(void) {
     max_target_steps = (int32_t)(MOTOR_PULSES_PER_REV * MOTOR_TARGET_REV);
 }
 
-void wait_for_button_release(void) {
+bool is_button_pressed_debounced(void) {
+    if (gpio_get_level(PIN_EMERGENCY_SWITCH) != 0) {
+        return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return gpio_get_level(PIN_EMERGENCY_SWITCH) == 0;
+}
+
+void wait_for_button_release_debounced(void) {
     vTaskDelay(pdMS_TO_TICKS(10));
     while (gpio_get_level(PIN_EMERGENCY_SWITCH) == 0) {
         vTaskDelay(pdMS_TO_TICKS(5));
@@ -130,34 +124,43 @@ void wait_for_button_release(void) {
 /* =========================================================================
  * [5] 기구부 및 밸브 하위 구동 제어부
  * ========================================================================= */
-void move_reverse_with_mon(int32_t max_steps) {
-    gpio_set_level(PIN_MOTOR_DIR, 0); // 방향: 하강 시퀀스
+bool move_reverse_with_mon(int32_t max_steps) {
+    gpio_set_level(PIN_MOTOR_DIR, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
     actual_moved_steps = 0;
     stop_requested = false;
 
     for (int32_t i = 0; i < max_steps; i++) {
+        asm volatile("memw");
+        if (hybrid_fire_triggered) {
+            stop_requested = true;
+            break;
+        }
+
         gpio_set_level(PIN_MOTOR_PUL, 1);
         ets_delay_us(MOTOR_PULSE_DELAY_US);
         gpio_set_level(PIN_MOTOR_PUL, 0);
         ets_delay_us(MOTOR_PULSE_DELAY_US);
         actual_moved_steps++;
 
-        // 하강 구동 중 안전상의 이유로 스위치를 치면 즉각 그 자리에서 정지
         if (gpio_get_level(PIN_EMERGENCY_SWITCH) == 0) {
             stop_requested = true;
             break;
         }
     }
+    return stop_requested;
 }
 
-void move_forward_return(int32_t steps_to_return) {
-    gpio_set_level(PIN_MOTOR_DIR, 1); // 방향: 상승 반전 복귀
-    vTaskDelay(pdMS_TO_TICKS(10));
+static void move_return_with_dir(int32_t steps_to_return, int dir_level) {
+    if (steps_to_return <= 0) {
+        steps_to_return = max_target_steps;
+    }
 
-    // 현장 물리적 특성 반영: 최소한 수조 구조의 형태를 갖추기 시작하는 1/3 지점 트리거 연산
+    gpio_set_level(PIN_MOTOR_DIR, dir_level);
+    vTaskDelay(pdMS_TO_TICKS(100)); // TB6600 세틀링 타임 100ms 확보
+
     int32_t trigger_point = steps_to_return / 3;
-    ESP_LOGE(TAG, "[!] 수조 복귀 상승 작동 ➡️ 총 스텝: %ld | 1/3 주수 시동점: %ld", steps_to_return, trigger_point);
+    ESP_LOGE(TAG, "[!] 수조 복귀 상승 가동 개시 ➡️ 목표 스텝: %ld | 1/3 주수 시동점: %ld", steps_to_return, trigger_point);
 
     for (int32_t i = 0; i < steps_to_return; i++) {
         gpio_set_level(PIN_MOTOR_PUL, 1);
@@ -165,13 +168,21 @@ void move_forward_return(int32_t steps_to_return) {
         gpio_set_level(PIN_MOTOR_PUL, 0);
         ets_delay_us(MOTOR_PULSE_DELAY_US);
 
-        // ★ [현장 맞춤 최적화 시퀀스]
-        // 방수포가 1/3 가량 펼쳐지기 시작해 수조 외벽이 확보되는 즉시 소화 주수 기동
-        if (i == trigger_point && hybrid_fire_triggered) {
-            ESP_LOGE(TAG, "[🌊 PUMP ON] 리프트 1/3 통과! 방수포 수조 내 주수 및 배수 순환 개시!!");
+        if (i == trigger_point) {
+            ESP_LOGE(TAG, "[🌊 PUMP ON] 리프트 1/3 통과! 방수포 수조 내 주수 시작!!");
             gpio_set_level(PIN_COOLING_PUMP, 1);
         }
     }
+}
+
+// 버튼 수동 복귀: 하강(DIR=0)의 반대 방향으로 상승
+void move_forward_return(int32_t steps_to_return) {
+    move_return_with_dir(steps_to_return, 1);
+}
+
+// 화재 긴급 복귀: 하강과 동일한 DIR 신호 방향으로 복귀
+void move_emergency_return(int32_t steps_to_return) {
+    move_return_with_dir(steps_to_return, 0);
 }
 
 /* =========================================================================
@@ -179,75 +190,75 @@ void move_forward_return(int32_t steps_to_return) {
  * ========================================================================= */
 void vTaskEmergencyMonitor(void *pvParameters) {
     while (1) {
-        bool current_switch_level = gpio_get_level(PIN_EMERGENCY_SWITCH);
+        asm volatile("memw");
+
         bool is_fire_detected = hybrid_fire_triggered;
 
         // -----------------------------------------------------------------
         // [A] 고전압 배터리 화재 트리거 시 무제한 순환 침수 소화 분기
         // -----------------------------------------------------------------
         if (is_fire_detected) {
-            ESP_LOGE(TAG, "[🔥 EMERGENCY] 배터리 팩 열폭주 확정 -> 방수포 이동식 수조 시스템 긴급 전개");
+            ESP_LOGE(TAG, "[🔥 EMERGENCY] 배터리 팩 열폭주 감지! 즉시 강제 상승 복귀!!");
 
-            // 1. 하강 상태였다면 리프트를 전개하여 침수용 외벽 수조 구축 개시 (상승하며 1/3에서 펌프 구동)
-            if (current_state == STATE_READY_FORWARD) {
-                move_forward_return(actual_moved_steps);
-                actual_moved_steps = 0;
-                current_state = STATE_READY_REVERSE;
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-            // 2. 이미 리프트가 상단에 대기 중이었다면 수조 형태가 완벽하므로 즉시 냉각수 투입
-            else {
-                if (gpio_get_level(PIN_COOLING_PUMP) == 0) {
-                    ESP_LOGW(TAG, "[!] 수조 이미 구축 완료 상태 포착 -> 즉시 소화수 주수 개시");
-                    gpio_set_level(PIN_COOLING_PUMP, 1);
-                }
-            }
+            // 하강 완료 상태이거나 중간에 걸친 발자취 스텝이 있다면 그만큼 복귀 연산
+            int32_t run_steps = (actual_moved_steps > 0) ? actual_moved_steps : max_target_steps;
 
-            // 3. 멈추지 말고 부어야 한다: 온도가 떨어져 Task 2에서 화재 플래그를 내릴 때까지
-            // 무제한으로 펌프 릴레이를 켜서 물을 순환 소화 시킵니다 (배수 및 냉각 지속).
+            move_emergency_return(run_steps);
+
+            actual_moved_steps = 0;
+            current_state = STATE_READY_REVERSE; // 상단 원점 마킹 고정
+            vTaskDelay(pdMS_TO_TICKS(100));
+
             while (hybrid_fire_triggered) {
+                asm volatile("memw");
                 ESP_LOGW(TAG, "[🔄 RECIRCULATING] 방수포 수조 내 순환 냉각 구동 중... (배터리 안정화 대기)");
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
 
-            // 4. 상황 종료 시 안전을 위해 즉시 주수 차단 후 원점 대기유지
             gpio_set_level(PIN_COOLING_PUMP, 0);
-            ESP_LOGI(TAG, "[✔ SAFE] 화재 시그널 완전 해제 -> 펌프 차단 및 상단 안정화 대기");
+            ESP_LOGI(TAG, "[✔ SAFE] 화재 시그널 완전 해제 -> 펌프 차단 및 상단 원점 대기");
         }
 
         // -----------------------------------------------------------------
-        // [B] 평상시 안전 상태용 수동 제어 상태 머신 (화재 미감지 시)
+        // [B] 평상시 수동 제어 상태 머신 (화재 미감지 시에만 진입)
         // -----------------------------------------------------------------
         if (!is_fire_detected) {
-            // 원점 상단 대기 상태에서 하강 지시 스캔
             if (current_state == STATE_READY_REVERSE) {
-                if (current_switch_level == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(10));
-                    if (gpio_get_level(PIN_EMERGENCY_SWITCH) == 0) {
-                        wait_for_button_release();
+                if (is_button_pressed_debounced()) {
+                    wait_for_button_release_debounced(); // 손을 완전히 뗄 때까지 대기
 
-                        // ★ [주차장 넘침 방지] 리프트가 내려가는 연산 즉시 물부터 끄고 움직입니다.
-                        gpio_set_level(PIN_COOLING_PUMP, 0);
-                        ESP_LOGW(TAG, "[↓ DOWN] 리프트 하강 지시 -> 펌프 오프 및 하강 기동");
+                    gpio_set_level(PIN_COOLING_PUMP, 0);
+                    ESP_LOGW(TAG, "[↓ DOWN] 리프트 하강 지시 -> 하강 기동");
 
-                        move_reverse_with_mon(max_target_steps);
+                    move_reverse_with_mon(max_target_steps);
+
+                    asm volatile("memw");
+                    if (hybrid_fire_triggered)
+                        continue; // 화재 발생 시 강제 분기
+
+                    if (actual_moved_steps < max_target_steps) {
+                        ESP_LOGI(TAG, "[!] 하강 중지됨 -> 상승 복귀");
+                        wait_for_button_release_debounced(); // 재입력 후 손 뗄 때까지 대기
+                        move_forward_return(actual_moved_steps);
+                        actual_moved_steps = 0;
+                        current_state = STATE_READY_REVERSE;
+                    } else {
+                        ESP_LOGI(TAG, "[✔ DOWN COMPLETE] 하강 완료 -> 하단 일반 감시 대기 모드 진입");
                         current_state = STATE_READY_FORWARD;
                     }
                 }
-            }
-            // 하단 감시 구역 대기 중 수동 강제 복귀 지시 스캔
-            else if (current_state == STATE_READY_FORWARD) {
-                if (current_switch_level == 0) {
+            } else if (current_state == STATE_READY_FORWARD) {
+                if (is_button_pressed_debounced()) {
                     ESP_LOGW(TAG, "[!] 작업자 수동 스위치 개입 -> 일반 리프트업 실행");
-                    wait_for_button_release();
+                    wait_for_button_release_debounced(); // 손을 완전히 뗄 때까지 대기
 
-                    // 평상시 일반 복귀이므로 move_forward_return 함수 내부에서 펌프가 돌지 않습니다.
                     move_forward_return(actual_moved_steps);
                     actual_moved_steps = 0;
                     current_state = STATE_READY_REVERSE;
                 }
             }
         }
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
@@ -256,30 +267,36 @@ void vTaskEmergencyMonitor(void *pvParameters) {
  * TASK 2: [하위우선순위] 리틀 엔디안 동기화 파싱 및 하이브리드 공간 화재 판정 (Core 0)
  * ========================================================================= */
 void vTaskSensorAndImageProcessing(void *pvParameters) {
-    static uint8_t rx_data[1544]; // 힙 오염 및 스택 오버플로우 완전 예방 정적 선언
+    static uint8_t rx_data[1544];
 
     while (1) {
-        // [1] MQ 가스 센서 아날로그 덤프
         int temp_mq = 0;
         adc_oneshot_read(adc1_handle, ADC_MQ_CHANNEL, &temp_mq);
         mq_raw_value = temp_mq;
 
-        // [2] GY-MCU90640 UART 하드웨어 링 버퍼 크기 폴링
+        // 가열 테스트 사양 (40도 / MQ 300 이상) 완전 하향 세팅 고정
+        float current_temp_threshold = TEMP_FIRE_PIXEL;
+        int current_area_threshold = FIRE_MIN_AREA_PIXELS;
+
+        if (mq_raw_value >= 1200 || (mq_raw_value >= 300 && mq_raw_value < 600)) {
+            current_temp_threshold = 40.0f;
+            current_area_threshold = 4;
+        } else if (mq_raw_value >= 600) {
+            current_temp_threshold = 65.0f;
+            current_area_threshold = 8;
+        }
+
         size_t available_length = 0;
         uart_get_buffered_data_len(UART_PORT_NUM, &available_length);
 
-        // 버퍼 가득 참 병목 및 과거 데이터 밀림 해결: 용량 포화 시 강제 플러시
         if (available_length > 4000) {
             uart_flush_input(UART_PORT_NUM);
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
 
-        // 정량 1프레임 바이트에 도달했을 때 정밀 동기화 판독 개시
         if (available_length >= 1544) {
             uint8_t head_byte = 0;
-
-            // 버퍼 0번 인덱스 위치가 헤더의 시작점인 0x5A가 될 때까지 1바이트씩만 안전 차감 전진
             uart_read_bytes(UART_PORT_NUM, &head_byte, 1, pdMS_TO_TICKS(1));
 
             if (head_byte == 0x5A) {
@@ -290,23 +307,15 @@ void vTaskSensorAndImageProcessing(void *pvParameters) {
                     rx_data[0] = 0x5A;
                     rx_data[1] = 0x5A;
 
-                    // 헤더 정렬 맞춤이 완료된 상태로 정확히 남은 1542바이트만 딱 도려내어 취득
                     int read_len = uart_read_bytes(UART_PORT_NUM, &rx_data[2], 1542, pdMS_TO_TICKS(50));
 
                     if (read_len == 1542) {
                         int pixel_idx = 0;
-
-                        // ★ [리틀 엔디안 복구 엔진 이식 완료]
-                        // 파이썬의 넘파이 frombuffer(int16) 구조식과 100% 매칭
-                        // 뒤 바이트(i+1)를 쉬프트한 상위로, 앞 바이트(i)를 하위로 비트 마스킹 결합
                         for (int i = 4; i < 1540; i += 2) {
                             if (pixel_idx < 768) {
                                 int16_t raw_temp = (int16_t)((rx_data[i + 1] << 8) | rx_data[i]);
-
-                                // 분할 스케일러 적용하여 실제 섭씨온도 도출
                                 float real_calculated_temp = (float)raw_temp / 100.0f;
 
-                                // 고전압 배터리 팩 방재 스펙 이외의 일시적인 하드웨어 튐(노이즈) 억제 마진 필터
                                 if (real_calculated_temp >= 5.0f && real_calculated_temp <= 120.0f) {
                                     mlx90640_frame[pixel_idx] = real_calculated_temp;
                                 }
@@ -318,45 +327,37 @@ void vTaskSensorAndImageProcessing(void *pvParameters) {
             }
         }
 
-        // [3] 경량 공간 영상처리 (매 루프 변수 클리어 필수)
         int hot_pixels = 0;
         float current_max = -40.0f;
 
         for (int i = 0; i < 32 * 24; i++) {
             float p = mlx90640_frame[i];
-
-            // 데이터 부재 상태인 완전 초기 공백만 상온 평탄화 보정
             if (p == 0.0f) {
                 mlx90640_frame[i] = 24.0f;
                 p = 24.0f;
             }
-
             if (p > current_max)
                 current_max = p;
-            if (p >= TEMP_FIRE_PIXEL) {
-                hot_pixels++; // 고온 면적 누적 카운팅
+
+            if (p >= current_temp_threshold) {
+                hot_pixels++;
             }
         }
         max_temp = current_max;
         high_temp_pixel_count = hot_pixels;
 
-        // [4] 하이브리드 고전압 배터리 방재 최종 연산 (문법 컴파일 에러 수정 완결)
-        bool is_gas_emergency = (mq_raw_value >= MQ_FIRE_THRESHOLD);
-        bool is_area_emergency = (high_temp_pixel_count >= FIRE_MIN_AREA_PIXELS);
-
-        if (is_gas_emergency && is_area_emergency) {
+        if (high_temp_pixel_count >= current_area_threshold) {
             hybrid_fire_triggered = true;
         } else {
             hybrid_fire_triggered = false;
         }
 
-        // [5] 정수형 섭씨 스케일 클린 매트릭스 출력 뷰
-        printf("\n=== [MLX90640 Aligned Subsystem Monitor (°C)] ===\n");
+        printf("\n=== [MLX90640 Sensor Fusion Monitor (°C)] ===\n");
         for (int y = 0; y < 24; y += 3) {
             for (int x = 0; x < 32; x += 4) {
                 float val = mlx90640_frame[y * 32 + x];
-                if (val >= TEMP_FIRE_PIXEL) {
-                    printf("!%3.0f! ", val); // 75도 이상 위험 구역 마킹
+                if (val >= current_temp_threshold) {
+                    printf("!%3.0f! ", val);
                 } else {
                     printf(" %3.0f  ", val);
                 }
@@ -364,11 +365,9 @@ void vTaskSensorAndImageProcessing(void *pvParameters) {
             printf("\n");
         }
         printf("-----------------------------------------------------\n");
-        printf("[DATA] Gas: %d | Peak: %.1f °C | Area: %d px\n",
-               mq_raw_value, max_temp, high_temp_pixel_count);
-        printf("[DIAG] Safety Status: %s | Cooling Pump: %s\n",
-               hybrid_fire_triggered ? "!! DANGER (TRIGGERED) !!" : "SAFE (MONITORING)",
-               gpio_get_level(PIN_COOLING_PUMP) ? "RUNNING (순환 중)" : "STOP (대기)");
+        printf("[FUSION] Dynamic Target Temp: %.1f °C | Target Area: %d px\n", current_temp_threshold, current_area_threshold);
+        printf("[DATA] Gas: %d | Peak Temp: %.1f °C | Current Hot Area: %d px\n", mq_raw_value, max_temp, high_temp_pixel_count);
+        printf("[DIAG] Safety Status: %s\n", hybrid_fire_triggered ? "!! DANGER (TRIGGERED) !!" : "SAFE (MONITORING)");
         printf("-----------------------------------------------------\n");
 
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -377,8 +376,6 @@ void vTaskSensorAndImageProcessing(void *pvParameters) {
 
 void app_main(void) {
     init_hardware();
-    // Core 1 할당: 오직 안전 스위치 폴링 및 모터/밸브 기구부 신속 제어 담당 (우선순위 최고)
     xTaskCreatePinnedToCore(vTaskEmergencyMonitor, "EmergencyMonitor", 4096, NULL, 3, NULL, 1);
-    // Core 0 할당: 대용량 패킷 덤프 파싱 및 공간 행렬 연산 처리 담당 (스택 8KB 증설)
     xTaskCreatePinnedToCore(vTaskSensorAndImageProcessing, "SensorProcessor", 8192, NULL, 1, NULL, 0);
 }
