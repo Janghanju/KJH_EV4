@@ -56,7 +56,7 @@ adc_oneshot_unit_handle_t adc1_handle;
 int32_t max_target_steps = 0;
 volatile int32_t actual_moved_steps = 0;
 bool stop_requested = false;
-bool needs_position_reset = false; // 화재 복귀가 설정된 20바퀴 미달 시 다음 입력에서 강제 복귀 필요
+bool needs_position_reset = false; // 화재 비상 복귀(move_emergency_return) 이후 true로 설정 -> 다음 버튼 입력 시 초기 위치(상단 원점)로 강제 복귀
 
 float mlx90640_frame[32 * 24];
 
@@ -175,7 +175,7 @@ static void move_return_with_dir(int32_t steps_to_return, int dir_level) {
     vTaskDelay(pdMS_TO_TICKS(100)); // TB6600 세틀링 타임 100ms 확보
 
     int32_t trigger_point = steps_to_return / 3;
-    ESP_LOGE(TAG, "[!] 수조 복귀 상승 가동 개시 ➡️ 목표 스텝: %ld | 1/3 주수 시동점: %ld", steps_to_return, trigger_point);
+    ESP_LOGE(TAG, "[!] 리프트 가동 개시 (DIR=%d) ➡️ 목표 스텝: %ld | 1/3 주수 시동점: %ld", dir_level, steps_to_return, trigger_point);
 
     for (int32_t i = 0; i < steps_to_return; i++) {
         gpio_set_level(PIN_MOTOR_PUL, 1);
@@ -213,7 +213,7 @@ void vTaskEmergencyMonitor(void *pvParameters) {
         // [A] 고전압 배터리 화재 트리거 시 무제한 순환 침수 소화 분기
         // -----------------------------------------------------------------
         if (is_fire_detected) {
-            ESP_LOGE(TAG, "[🔥 EMERGENCY] 배터리 팩 열폭주 감지! 즉시 강제 상승 복귀!!");
+            ESP_LOGE(TAG, "[🔥 EMERGENCY] 배터리 팩 열폭주 감지! 즉시 비상 복귀 동작 개시!!");
 
             // 하강 완료 상태이거나 중간에 걸친 발자취 스텝이 있다면 그만큼 복귀 연산
             int32_t run_steps = (actual_moved_steps > 0) ? actual_moved_steps : max_target_steps;
@@ -224,7 +224,7 @@ void vTaskEmergencyMonitor(void *pvParameters) {
             ESP_LOGW(TAG, "[!] 화재 복귀 이동(%ld 스텝) 완료 -> 다음 버튼 입력 시 초기 위치로 강제 복귀 필요", run_steps);
 
             actual_moved_steps = 0;
-            current_state = STATE_READY_REVERSE; // 상단 원점 마킹 고정
+            current_state = STATE_READY_REVERSE; // needs_position_reset에 의해 다음 입력에서 강제 보정될 임시 상태
             vTaskDelay(pdMS_TO_TICKS(100));
 
             while (hybrid_fire_triggered) {
@@ -234,7 +234,7 @@ void vTaskEmergencyMonitor(void *pvParameters) {
             }
 
             gpio_set_level(PIN_COOLING_PUMP, 0);
-            ESP_LOGI(TAG, "[✔ SAFE] 화재 시그널 완전 해제 -> 펌프 차단 및 상단 원점 대기");
+            ESP_LOGI(TAG, "[✔ SAFE] 화재 시그널 완전 해제 -> 펌프 차단, 다음 버튼 입력 시 초기 위치(상단 원점)로 복귀 대기");
         }
 
         // -----------------------------------------------------------------
