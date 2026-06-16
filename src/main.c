@@ -166,38 +166,55 @@ bool move_reverse_with_mon(int32_t max_steps) {
     return stop_requested;
 }
 
-static void move_return_with_dir(int32_t steps_to_return, int dir_level) {
-    if (steps_to_return <= 0) {
-        steps_to_return = max_target_steps;
-    }
+// 비상 전개(DIR=0): 리프트 상승 → 수조가 차량을 덮음
+// 전체 이동 거리의 1/3 지점에서 펌프 릴레이 기동 (PUL 루프 정지 후 전환 → EMI 간섭 방지)
+void move_emergency_return(int32_t steps_to_return) {
+    if (steps_to_return <= 0) steps_to_return = max_target_steps;
+    ESP_LOGE(TAG, "[!] 비상 전개 개시 ➡️ 목표 스텝: %ld", steps_to_return);
 
-    gpio_set_level(PIN_MOTOR_DIR, dir_level);
-    vTaskDelay(pdMS_TO_TICKS(100)); // TB6600 세틀링 타임 100ms 확보
+    gpio_set_level(PIN_MOTOR_DIR, 0);
+    vTaskDelay(pdMS_TO_TICKS(200));
 
     int32_t trigger_point = steps_to_return / 3;
-    ESP_LOGE(TAG, "[!] 리프트 가동 개시 (DIR=%d) ➡️ 목표 스텝: %ld | 1/3 주수 시동점: %ld", dir_level, steps_to_return, trigger_point);
+    if (trigger_point < 50) trigger_point = 50;
+    if (trigger_point > steps_to_return) trigger_point = steps_to_return;
 
+    // [1단계] 0 → 1/3 구간 (펌프 OFF)
+    for (int32_t i = 0; i < trigger_point; i++) {
+        gpio_set_level(PIN_MOTOR_PUL, 1);
+        ets_delay_us(MOTOR_PULSE_DELAY_US);
+        gpio_set_level(PIN_MOTOR_PUL, 0);
+        ets_delay_us(MOTOR_PULSE_DELAY_US);
+    }
+
+    // 1/3 지점 도달: 루프 정지 상태에서 릴레이 기동
+    vTaskDelay(pdMS_TO_TICKS(100));
+    ESP_LOGE(TAG, "[🌊 PUMP ON] 전개 1/3 통과 -> 소화수 펌프 릴레이 기동!!");
+    gpio_set_level(PIN_COOLING_PUMP, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // [2단계] 1/3 → 끝 구간 (펌프 ON 유지)
+    for (int32_t i = trigger_point; i < steps_to_return; i++) {
+        gpio_set_level(PIN_MOTOR_PUL, 1);
+        ets_delay_us(MOTOR_PULSE_DELAY_US);
+        gpio_set_level(PIN_MOTOR_PUL, 0);
+        ets_delay_us(MOTOR_PULSE_DELAY_US);
+    }
+}
+
+// 수조 원위치 복귀(DIR=1): 리프트 하강 → 내려가는 순간 즉시 펌프 차단
+void move_forward_return(int32_t steps_to_return) {
+    if (steps_to_return <= 0) steps_to_return = max_target_steps;
+    gpio_set_level(PIN_COOLING_PUMP, 0); // 하강 시작 즉시 펌프 차단
+    ESP_LOGE(TAG, "[!] 원위치 복귀 개시 ➡️ 목표 스텝: %ld", steps_to_return);
+    gpio_set_level(PIN_MOTOR_DIR, 1);
+    vTaskDelay(pdMS_TO_TICKS(200));
     for (int32_t i = 0; i < steps_to_return; i++) {
         gpio_set_level(PIN_MOTOR_PUL, 1);
         ets_delay_us(MOTOR_PULSE_DELAY_US);
         gpio_set_level(PIN_MOTOR_PUL, 0);
         ets_delay_us(MOTOR_PULSE_DELAY_US);
-
-        if (i == trigger_point) {
-            ESP_LOGE(TAG, "[🌊 PUMP ON] 리프트 1/3 통과! 방수포 수조 내 주수 시작!!");
-            gpio_set_level(PIN_COOLING_PUMP, 1);
-        }
     }
-}
-
-// 버튼 수동 복귀: 하강(DIR=0)의 반대 방향으로 상승
-void move_forward_return(int32_t steps_to_return) {
-    move_return_with_dir(steps_to_return, 1);
-}
-
-// 화재 긴급 복귀: 하강과 동일한 DIR 신호 방향으로 복귀
-void move_emergency_return(int32_t steps_to_return) {
-    move_return_with_dir(steps_to_return, 0);
 }
 
 /* =========================================================================
@@ -218,23 +235,25 @@ void vTaskEmergencyMonitor(void *pvParameters) {
             // 하강 완료 상태이거나 중간에 걸친 발자취 스텝이 있다면 그만큼 복귀 연산
             int32_t run_steps = (actual_moved_steps > 0) ? actual_moved_steps : max_target_steps;
 
+            // move_emergency_return 내부에서 1/3 지점 도달 시 펌프 자동 기동
             move_emergency_return(run_steps);
 
-            needs_position_reset = true; // 화재로 이동한 리프트는 다음 버튼 입력 시 초기 위치로 복귀
-            ESP_LOGW(TAG, "[!] 화재 복귀 이동(%ld 스텝) 완료 -> 다음 버튼 입력 시 초기 위치로 강제 복귀 필요", run_steps);
+            needs_position_reset = true;
+            ESP_LOGW(TAG, "[!] 화재 전개(%ld 스텝) 완료 -> 펌프 순환 유지, 버튼 입력 시 원위치 복귀", run_steps);
 
             actual_moved_steps = 0;
-            current_state = STATE_READY_REVERSE; // needs_position_reset에 의해 다음 입력에서 강제 보정될 임시 상태
+            current_state = STATE_READY_REVERSE;
             vTaskDelay(pdMS_TO_TICKS(100));
 
+            // 화재 해제까지 펌프 ON 유지 (리프트 내려가기 전까지 계속 가동)
             while (hybrid_fire_triggered) {
                 asm volatile("memw");
                 ESP_LOGW(TAG, "[🔄 RECIRCULATING] 방수포 수조 내 순환 냉각 구동 중... (배터리 안정화 대기)");
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
 
-            gpio_set_level(PIN_COOLING_PUMP, 0);
-            ESP_LOGI(TAG, "[✔ SAFE] 화재 시그널 완전 해제 -> 펌프 차단, 다음 버튼 입력 시 초기 위치(상단 원점)로 복귀 대기");
+            // 화재 해제 후에도 펌프 ON 유지 → 버튼으로 리프트 하강 시작 즉시 move_forward_return 내부에서 차단
+            ESP_LOGI(TAG, "[✔ SAFE] 화재 시그널 해제 -> 펌프 유지, 버튼으로 원위치 복귀 대기");
         }
 
         // -----------------------------------------------------------------
@@ -245,9 +264,10 @@ void vTaskEmergencyMonitor(void *pvParameters) {
                 if (is_button_pressed_debounced()) {
                     if (needs_position_reset || is_button_held_long(BUTTON_RESET_HOLD_MS)) {
                         wait_for_button_release_debounced();
-                        ESP_LOGW(TAG, "[⬆ RESET] %s -> 초기 위치(상단 원점)로 강제 복귀",
+                        ESP_LOGW(TAG, "[⬆ RESET] %s -> 초기 위치(상단 원점)로 복귀 (리프트 하강 즉시 펌프 차단)",
                                  needs_position_reset ? "화재 복귀 후 초기화" : "롱프레스 감지");
 
+                        // move_forward_return 내부에서 펌프 즉시 차단 후 복귀
                         move_forward_return(max_target_steps);
 
                         actual_moved_steps = 0;
@@ -258,8 +278,7 @@ void vTaskEmergencyMonitor(void *pvParameters) {
 
                     wait_for_button_release_debounced(); // 손을 완전히 뗄 때까지 대기
 
-                    gpio_set_level(PIN_COOLING_PUMP, 0);
-                    ESP_LOGW(TAG, "[↓ DOWN] 리프트 하강 지시 -> 하강 기동");
+                    ESP_LOGW(TAG, "[↑ UP] 리프트 상승 지시 -> 수조 전개 기동");
 
                     move_reverse_with_mon(max_target_steps);
 
