@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-KJH_EV4 실시간 열화상 모니터 GUI  v2.0
+KJH_EV4 실시간 열화상 모니터 GUI  v3.0
 ========================================
 실행:  python3 thermal_monitor.py
 설치:  python3 -m pip install pyserial matplotlib numpy
+
+연결 모드
+  - GY-MCU90640 직접: 센서를 USB-UART 어댑터로 PC에 직결, 1544바이트 바이너리 프레임 읽기
+  - ESP32 릴레이:     ESP32 USB에 연결, $H/$DATA 텍스트 라인 파싱
+  - 자동 감지:        연결 후 첫 바이트를 확인해 모드 자동 결정
 """
 
 import csv
@@ -12,6 +17,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time as _time
 from datetime import datetime
 from tkinter import filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -85,6 +91,7 @@ class App:
         # 런타임 상태
         self.ser          = None
         self.running      = False
+        self.binary_mode  = False   # True = GY-MCU90640 직접 바이너리, False = ESP32 텍스트
         self.data_q       = queue.Queue(maxsize=30)
         self.csv_file     = None
         self.csv_writer   = None
@@ -94,6 +101,7 @@ class App:
         self.last_fire    = False
         self._fps_cnt     = 0
         self._fps_ts      = datetime.now().timestamp()
+        self._frame_t0    = _time.time()  # FPS 계산용
 
         # 그래프 히스토리
         self.ht: list = []
@@ -130,7 +138,18 @@ class App:
         self.port_cb.pack(side=tk.LEFT, padx=(0, 3))
 
         self._btn(bar, "⟳ 새로고침", self._refresh_ports,
-                  bg=PNL).pack(side=tk.LEFT, padx=(0, 8))
+                  bg=PNL).pack(side=tk.LEFT, padx=(0, 6))
+
+        # ── 연결 모드 선택 ──────────────────────────────────────────────────
+        self._lb(bar, "모드:").pack(side=tk.LEFT, padx=(0, 3))
+        self.mode_var = tk.StringVar(value="자동 감지")
+        mode_menu = tk.OptionMenu(bar, self.mode_var,
+                                  "자동 감지", "GY-MCU90640 직접", "ESP32 릴레이")
+        mode_menu.configure(bg=PNL, fg=WHT, activebackground=ACC,
+                            font=("Helvetica", 9), relief="flat",
+                            highlightthickness=0, width=14)
+        mode_menu["menu"].configure(bg=PNL, fg=WHT)
+        mode_menu.pack(side=tk.LEFT, padx=(0, 8))
 
         self.conn_btn = self._btn(bar, "▶  연결", self._toggle_connect, bg="#1a6b3a")
         self.conn_btn.pack(side=tk.LEFT, padx=(0, 8))
@@ -352,7 +371,8 @@ class App:
     def _connect(self):
         port = self.port_var.get()
         if not port or port == "(포트 없음)":
-            messagebox.showwarning("포트 없음", "ESP32를 USB로 연결한 뒤 ⟳ 클릭해 포트를 선택하세요.")
+            messagebox.showwarning("포트 없음",
+                "디바이스를 USB로 연결한 뒤 ⟳ 클릭해 포트를 선택하세요.")
             return
         try:
             self.ser = serial.Serial(port=port, baudrate=BAUD,
@@ -365,20 +385,47 @@ class App:
             return
 
         self.running = True
+        self.binary_mode = False
         self.frame_count = self.drop_count = self._fps_cnt = self.parse_fail = 0
-        self._fps_ts = datetime.now().timestamp()
+        self._fps_ts = self._frame_t0 = _time.time()
+
+        # ── 모드 결정 ────────────────────────────────────────────────────────
+        chosen = self.mode_var.get()
+        if chosen == "GY-MCU90640 직접":
+            self.binary_mode = True
+        elif chosen == "ESP32 릴레이":
+            self.binary_mode = False
+        else:
+            # 자동 감지: 첫 수신 바이트로 판단
+            self.ser.timeout = 0.5
+            probe = self.ser.read(16)
+            self.ser.timeout = 2.0
+            non_print = sum(1 for b in probe if b < 32 and b not in (0x0A, 0x0D))
+            self.binary_mode = (non_print >= 3)
+            self._log(
+                f"자동 감지: {'바이너리(GY-MCU90640)' if self.binary_mode else '텍스트(ESP32)'} "
+                f"[probe={probe.hex()}]", "info")
+
+        mode_label = "GY-MCU90640 직접" if self.binary_mode else "ESP32 릴레이"
+        self.conn_btn.configure(text="■  연결 해제", bg="#7b1c1c")
+        self.conn_lbl.configure(text=f"●  {port}  [{mode_label}]", fg=GRN)
+        self._log(f"포트 연결: {port}  ({BAUD} baud)  모드={mode_label}", "info")
 
         if self.csv_var.get():
             self._init_csv()
 
-        threading.Thread(target=self._reader, daemon=True).start()
-        self.conn_btn.configure(text="■  연결 해제", bg="#7b1c1c")
-        self.conn_lbl.configure(text=f"●  {port}", fg=GRN)
-        self._log(f"포트 연결: {port}  ({BAUD} baud)", "info")
+        reader = self._reader_binary if self.binary_mode else self._reader_text
+        threading.Thread(target=reader, daemon=True).start()
 
     def _disconnect(self):
         self.running = False
         if self.ser and self.ser.is_open:
+            if self.binary_mode:
+                try:
+                    # GY-MCU90640 자동 전송 중지 명령
+                    self.ser.write(bytes([0xA5, 0x35, 0x01, 0xDB]))
+                except Exception:
+                    pass
             self.ser.close()
         if self.csv_file:
             self.csv_file.close()
@@ -394,10 +441,11 @@ class App:
         d = self.save_dir.get()
         os.makedirs(d, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fp = os.path.join(d, f"thermal_{ts}.csv")
+        mode = "bin" if self.binary_mode else "esp"
+        fp  = os.path.join(d, f"thermal_{mode}_{ts}.csv")
         self.csv_file   = open(fp, "w", newline="", encoding="utf-8")
         hdr = ["timestamp", "tick_ms", "mq_raw", "max_temp_c",
-               "hot_pixels", "fire_triggered"]
+               "hot_pixels", "fire_triggered", "ambient_c"]
         hdr += [f"t{i:03d}" for i in range(NPIX)]
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(hdr)
@@ -420,9 +468,89 @@ class App:
             subprocess.Popen(["xdg-open", d])
 
     # =========================================================================
-    # 8. 시리얼 수신 스레드
+    # 8a. 바이너리 수신 스레드 — GY-MCU90640 직접 연결 (참조 구현 기반)
+    #     1544바이트 프레임: 0x5A 0x5A [2B] [768×int16 픽셀 LE] [2B ambient] [2B]
     # =========================================================================
-    def _reader(self):
+    def _reader_binary(self):
+        # 4Hz 자동 수집 시작 명령 (참조 코드와 동일)
+        try:
+            self.ser.write(bytes([0xA5, 0x25, 0x01, 0xCB]))  # set 4 Hz
+            _time.sleep(0.1)
+            self.ser.write(bytes([0xA5, 0x35, 0x02, 0xDC]))  # start auto
+            self.root.after(0, self._log,
+                "[바이너리] GY-MCU90640 4Hz 자동 수집 시작", "info")
+        except Exception as e:
+            self.root.after(0, self._log,
+                f"[바이너리] 시작 명령 전송 실패: {e}", "warn")
+
+        while self.running:
+            try:
+                # ── 0x5A 0x5A 동기 헤더 탐색 ─────────────────────────────
+                b1 = self.ser.read(1)
+                if not b1:
+                    continue
+                if b1[0] != 0x5A:
+                    continue
+                b2 = self.ser.read(1)
+                if not b2 or b2[0] != 0x5A:
+                    continue
+
+                # ── 나머지 1542바이트 읽기 ───────────────────────────────
+                rest = self.ser.read(1542)
+                if len(rest) < 1542:
+                    self.root.after(0, self._log,
+                        f"[바이너리] 짧은 프레임: {len(rest)+2}/1544", "warn")
+                    continue
+
+                frame = bytes([0x5A, 0x5A]) + rest
+
+                # ── 픽셀 온도 파싱 (bytes 4‥1539, int16 LE, ÷100 = °C) ──
+                raw_pix = frame[4:1540]
+                arr16   = np.frombuffer(raw_pix, dtype=np.int16)  # LE
+                pixels  = (arr16.astype(np.float32) / 100.0).tolist()
+
+                # ── 주변 온도 (bytes 1540‥1541, int16 LE) ────────────────
+                ta = (int(frame[1540]) + int(frame[1541]) * 256) / 100.0
+
+                max_t  = float(max(pixels))
+                hot_px = sum(1 for p in pixels if p >= 45.0)
+                now_t  = _time.time()
+                fps    = 1.0 / max(now_t - self._frame_t0, 0.001)
+                self._frame_t0 = now_t
+
+                data = {
+                    "tick_ms":    int(now_t * 1000) & 0x7FFFFFFF,
+                    "mq":         0,
+                    "max_temp":   max_t,
+                    "hot_pixels": hot_px,
+                    "fire":       max_t >= 50.0,
+                    "pixels":     pixels,
+                    "ambient":    ta,
+                    "fps_bin":    fps,
+                    "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                }
+
+                try:
+                    self.data_q.put_nowait(data)
+                except queue.Full:
+                    self.drop_count += 1
+                    try:
+                        self.data_q.get_nowait()
+                        self.data_q.put_nowait(data)
+                    except queue.Empty:
+                        pass
+
+            except serial.SerialException:
+                self.running = False
+                self.root.after(0, self._disconnect)
+                break
+            except Exception as e:
+                self.root.after(0, self._log, f"[binary error] {e}", "warn")
+
+    # =========================================================================
+    # 8b. 텍스트 수신 스레드 — ESP32 릴레이 ($H 신포맷 / $DATA 구포맷)
+    # =========================================================================
+    def _reader_text(self):
         while self.running:
             try:
                 raw  = self.ser.readline()
@@ -441,15 +569,13 @@ class App:
                         except queue.Empty:
                             pass
                 elif line.startswith("$H,") or line.startswith("$DATA,"):
-                    # 구조화 라인인데 파싱 실패 → 잘린 수신
                     self.parse_fail += 1
                     if self.parse_fail <= 5 or self.parse_fail % 50 == 0:
                         self.root.after(0, self._log,
-                            f"[parse FAIL #{self.parse_fail}] fmt={'$H' if line.startswith('$H') else '$DATA'} "
-                            f"len={len(line)}",
-                            "warn")
+                            f"[parse FAIL #{self.parse_fail}] "
+                            f"fmt={'$H' if line.startswith('$H') else '$DATA'} "
+                            f"len={len(line)}", "warn")
                 elif line and not line.startswith("$"):
-                    # ESP32 일반 디버그 텍스트는 로그에 표시
                     self.root.after(0, self._log, line[:160])
             except serial.SerialException:
                 self.running = False
@@ -595,14 +721,18 @@ class App:
 
         # ── 수신 데이터 바 ─────────────────────────────────────────────────────
         self.dlbl["tick"].configure(text=str(d["tick_ms"]))
-        self.dlbl["mq"].configure(text=str(d["mq"]))
+        self.dlbl["mq"].configure(
+            text=str(d["mq"]) if d["mq"] else
+                 f'Ta={d.get("ambient", 0):.1f}°C')
         self.dlbl["temp"].configure(text=f"{d['max_temp']:.1f}°C",
                                      fg=RED if d["max_temp"] >= 75 else CYN)
         self.dlbl["hot"].configure(text=str(d["hot_pixels"]))
         self.dlbl["fire"].configure(
             text="FIRE" if d["fire"] else "SAFE",
             fg=RED if d["fire"] else GRN)
-        self.dlbl["frames"].configure(text=str(self.frame_count))
+        self.dlbl["frames"].configure(
+            text=f"{self.frame_count}"
+                 + (f"  {d['fps_bin']:.1f}fps" if "fps_bin" in d else ""))
 
         # ── 시계열 그래프 ─────────────────────────────────────────────────────
         t = d["tick_ms"] / 1000.0
@@ -624,8 +754,10 @@ class App:
 
         # ── CSV 저장 ──────────────────────────────────────────────────────────
         if self.csv_writer:
+            ambient = d.get("ambient", "")
             row = [d["ts"], d["tick_ms"], d["mq"],
-                   f"{d['max_temp']:.2f}", d["hot_pixels"], int(d["fire"])]
+                   f"{d['max_temp']:.2f}", d["hot_pixels"], int(d["fire"]),
+                   f"{ambient:.2f}" if ambient != "" else ""]
             row += [f"{v:.2f}" for v in d["pixels"]]
             try:
                 self.csv_writer.writerow(row)
