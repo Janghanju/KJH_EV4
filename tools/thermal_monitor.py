@@ -34,7 +34,21 @@ try:
     from matplotlib.figure import Figure
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
     import matplotlib.gridspec as gridspec
+    import matplotlib.font_manager as fm
     import numpy as np
+
+    # macOS/Windows/Linux 한글 폰트 자동 선택
+    _ko_candidates = [
+        "Apple SD Gothic Neo", "AppleGothic",          # macOS
+        "Malgun Gothic", "Gulim",                       # Windows
+        "NanumGothic", "NanumBarunGothic", "Noto Sans KR",  # Linux / 설치된 경우
+    ]
+    _available = {f.name for f in fm.fontManager.ttflist}
+    _ko_font = next((f for f in _ko_candidates if f in _available), None)
+    if _ko_font:
+        matplotlib.rcParams["font.family"] = _ko_font
+    matplotlib.rcParams["axes.unicode_minus"] = False
+
 except ImportError:
     _missing.append("matplotlib  numpy")
 
@@ -99,6 +113,10 @@ class ThermalMonitorApp:
         self.hist_t    = []   # tick(s)
         self.hist_temp = []
         self.hist_mq   = []
+
+        # FPS 카운터 (연결 전에도 _tick이 호출되므로 여기서 초기화)
+        self._fps_count = 0
+        self._fps_ts    = datetime.now().timestamp()
 
         self._build_styles()
         self._build_toolbar()
