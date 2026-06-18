@@ -615,10 +615,20 @@ class App:
 
 # ─── 진입점 ──────────────────────────────────────────────────────────────────
 def main():
+    print("KJH_EV4 열화상 모니터 시작 중...", flush=True)
     root = tk.Tk()
     app  = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
+
+    # macOS: 창을 맨 앞으로 강제 표시
+    root.lift()
+    root.attributes("-topmost", True)
+    root.after(200, lambda: root.attributes("-topmost", False))
+    root.focus_force()
+
+    print("창 표시 완료 — ESP32 USB 연결 후 포트를 선택하세요.", flush=True)
     root.mainloop()
+    print("종료.", flush=True)
 
 
 if __name__ == "__main__":
