@@ -444,6 +444,17 @@ void vTaskSensorAndImageProcessing(void *pvParameters) {
         printf("[DIAG] Safety Status: %s\n", hybrid_fire_triggered ? "!! DANGER (TRIGGERED) !!" : "SAFE (MONITORING)");
         printf("-----------------------------------------------------\n");
 
+        // PC 시각화 및 데이터 로깅용 구조화 출력 (Python 수신 파서 대상)
+        // 포맷: $DATA,<tick_ms>,<mq>,<max_temp>,<hot_pixels>,<fire>,<t0>,...<t767>
+        printf("$DATA,%lu,%d,%.2f,%d,%d",
+               (unsigned long)xTaskGetTickCount(),
+               mq_raw_value, max_temp, high_temp_pixel_count,
+               (int)hybrid_fire_triggered);
+        for (int i = 0; i < 768; i++) {
+            printf(",%.2f", mlx90640_frame[i]);
+        }
+        printf("\n");
+
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }

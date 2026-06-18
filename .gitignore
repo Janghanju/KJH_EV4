@@ -3,3 +3,9 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Python 열화상 모니터
+tools/logs/
+tools/__pycache__/
+tools/*.pyc
+__pycache__/
