@@ -90,6 +90,7 @@ class App:
         self.csv_writer   = None
         self.frame_count  = 0
         self.drop_count   = 0
+        self.parse_fail   = 0
         self.last_fire    = False
         self._fps_cnt     = 0
         self._fps_ts      = datetime.now().timestamp()
@@ -198,7 +199,7 @@ class App:
         self.im = self.ax_th.imshow(
             np.full((ROWS, COLS), 25.0),
             cmap="inferno", vmin=20, vmax=80,
-            aspect="auto", interpolation="bilinear"
+            aspect="auto", interpolation="bicubic"  # 참조 구현처럼 부드러운 보간
         )
 
         cb = self.fig_th.colorbar(self.im, ax=self.ax_th, fraction=0.04, pad=0.02)
@@ -364,7 +365,7 @@ class App:
             return
 
         self.running = True
-        self.frame_count = self.drop_count = self._fps_cnt = 0
+        self.frame_count = self.drop_count = self._fps_cnt = self.parse_fail = 0
         self._fps_ts = datetime.now().timestamp()
 
         if self.csv_var.get():
@@ -439,33 +440,55 @@ class App:
                             self.data_q.put_nowait(data)
                         except queue.Empty:
                             pass
+                elif line.startswith("$H,"):
+                    # $H 라인인데 파싱 실패 → 잘린 라인
+                    self.parse_fail += 1
+                    if self.parse_fail <= 5 or self.parse_fail % 50 == 0:
+                        self.root.after(0, self._log,
+                            f"[parse FAIL #{self.parse_fail}] len={len(line)} "
+                            f"hex_len={len(line.split(',')[-1]) if ',' in line else 0}",
+                            "warn")
                 elif line and not line.startswith("$"):
-                    self.root.after(0, self._log, line[:150])
+                    # ESP32 일반 디버그 텍스트는 로그에 표시
+                    self.root.after(0, self._log, line[:160])
             except serial.SerialException:
                 self.running = False
                 self.root.after(0, self._disconnect)
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                self.root.after(0, self._log, f"[reader error] {e}", "warn")
 
     @staticmethod
     def _parse(line: str):
-        if not line.startswith("$DATA,"):
+        """
+        $H 포맷 파싱 (컴팩트 hex 인코딩)
+        $H,<tick_ms>,<mq>,<maxtemp*100>,<hot_pixels>,<fire>,<3072 hex = 768×int16×100>
+        참조: GY-MCU90640 int16 little-endian × 100 온도값
+        """
+        if not line.startswith("$H,"):
             return None
-        p = line.split(",")
-        if len(p) < 6 + NPIX:
+        # 헤더 6 필드 + hex blob
+        p = line.split(",", 6)
+        if len(p) < 7:
             return None
         try:
+            hex_blob = p[6].strip()
+            if len(hex_blob) < NPIX * 4:   # 768 pixels × 4 hex chars
+                return None
+            # 참조 구현과 동일: bytes → int16 LE → float / 100
+            raw   = bytes.fromhex(hex_blob[:NPIX * 4])
+            arr16 = np.frombuffer(raw, dtype=">i2")      # int16 big-endian (printf %04X = MSB first)
+            pixels = (arr16.astype(np.float32) / 100.0).tolist()
             return {
                 "tick_ms":    int(p[1]),
                 "mq":         int(p[2]),
-                "max_temp":   float(p[3]),
+                "max_temp":   int(p[3]) / 100.0,
                 "hot_pixels": int(p[4]),
                 "fire":       bool(int(p[5])),
-                "pixels":     [float(x) for x in p[6: 6 + NPIX]],
+                "pixels":     pixels,
                 "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
             }
-        except (ValueError, IndexError):
+        except (ValueError, IndexError, Exception):
             return None
 
     # =========================================================================
@@ -494,40 +517,47 @@ class App:
 
             self.frame_lbl.configure(
                 text=f"프레임: {self.frame_count}  |  드롭: {self.drop_count}")
-        except Exception:
-            pass
+        except Exception as e:
+            # 에러를 로그에 표시 (silent swallow 금지)
+            try:
+                self._log(f"[tick error] {e}", "warn")
+            except Exception:
+                pass
         finally:
             self.root.after(200, self._tick)
 
     def _render(self, d: dict):
-        arr = np.array(d["pixels"]).reshape(ROWS, COLS)
+        # ── 열화상 업데이트 (참조 구현처럼 int16→float 배열 직접 렌더) ──────
+        arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
 
-        # 열화상 업데이트
+        # 동적 범위: 실제 min/max 기반 (참조 구현의 Tmin/Tmax 고정 대신 자동)
+        lo = float(arr.min())
+        hi = float(arr.max())
+        if hi - lo < 1.0:          # 차이가 너무 작으면 ±5 여유 추가
+            lo -= 5.0; hi += 5.0
         self.im.set_data(arr)
-        lo = max(20.0, float(arr.min()) - 2)
-        hi = min(150.0, float(arr.max()) + 2)
-        if hi > lo + 1:
-            self.im.set_clim(lo, hi)
+        self.im.set_clim(lo, hi)
 
+        # 최고온도 위치 십자선 + 오버레이
         r, c = divmod(int(arr.argmax()), COLS)
         self.ch_h.set_ydata([r])
         self.ch_v.set_xdata([c])
-        self.hot_txt.set_position((min(c + 0.5, COLS - 4), max(r - 0.8, 0)))
+        self.hot_txt.set_position((min(c + 0.5, COLS - 5), max(r - 0.8, 0.5)))
         self.hot_txt.set_text(f"{arr[r, c]:.1f}°C")
-        self.canvas_th.draw_idle()
+        self.canvas_th.draw()           # draw_idle 대신 draw() 로 즉시 갱신
 
-        # 화재 상태
+        # ── 화재 상태 ──────────────────────────────────────────────────────────
         is_fire = d["fire"]
         self.fire_lbl.configure(
             text="🔥  FIRE !!" if is_fire else "✔  SAFE",
             fg=RED if is_fire else GRN)
         if is_fire and not self.last_fire:
             self._log(
-                f"[FIRE ALERT] {d['ts']}  Max={d['max_temp']:.1f}°C  Gas={d['mq']}",
+                f"[FIRE] {d['ts']}  Max={d['max_temp']:.1f}°C  Gas={d['mq']}",
                 "fire")
         self.last_fire = is_fire
 
-        # 수치 표시
+        # ── 수치 패널 ──────────────────────────────────────────────────────────
         self.metrics["max_temp"].configure(
             text=f"{d['max_temp']:.1f} °C",
             fg=RED if d["max_temp"] >= 75 else WHT)
@@ -538,17 +568,18 @@ class App:
             text=str(d["mq"]),
             fg=RED if d["mq"] >= 1200 else ORG if d["mq"] >= 300 else WHT)
 
-        # 데이터 바
+        # ── 수신 데이터 바 ─────────────────────────────────────────────────────
         self.dlbl["tick"].configure(text=str(d["tick_ms"]))
         self.dlbl["mq"].configure(text=str(d["mq"]))
-        self.dlbl["temp"].configure(text=f"{d['max_temp']:.1f}°C")
+        self.dlbl["temp"].configure(text=f"{d['max_temp']:.1f}°C",
+                                     fg=RED if d["max_temp"] >= 75 else CYN)
         self.dlbl["hot"].configure(text=str(d["hot_pixels"]))
         self.dlbl["fire"].configure(
             text="FIRE" if d["fire"] else "SAFE",
             fg=RED if d["fire"] else GRN)
         self.dlbl["frames"].configure(text=str(self.frame_count))
 
-        # 시계열 그래프
+        # ── 시계열 그래프 ─────────────────────────────────────────────────────
         t = d["tick_ms"] / 1000.0
         self.ht.append(t)
         self.htemp.append(d["max_temp"])
@@ -561,19 +592,21 @@ class App:
         self.ax_temp.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0] + 1))
         self.ax_temp.set_ylim(max(0, min(self.htemp) - 5),
                                max(100, max(self.htemp) + 5))
-
         self.ln_mq.set_data(self.ht, self.hmq)
         self.ax_mq.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0] + 1))
         self.ax_mq.set_ylim(0, max(1500, max(self.hmq) + 100))
-        self.canvas_g.draw_idle()
+        self.canvas_g.draw()            # 즉시 갱신
 
-        # CSV 저장
+        # ── CSV 저장 ──────────────────────────────────────────────────────────
         if self.csv_writer:
             row = [d["ts"], d["tick_ms"], d["mq"],
                    f"{d['max_temp']:.2f}", d["hot_pixels"], int(d["fire"])]
             row += [f"{v:.2f}" for v in d["pixels"]]
-            self.csv_writer.writerow(row)
-            self.csv_file.flush()
+            try:
+                self.csv_writer.writerow(row)
+                self.csv_file.flush()
+            except Exception as e:
+                self._log(f"[CSV error] {e}", "warn")
 
     # =========================================================================
     # 유틸

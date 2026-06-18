@@ -426,32 +426,21 @@ void vTaskSensorAndImageProcessing(void *pvParameters) {
             hybrid_fire_triggered = false;
         }
 
-        printf("\n=== [MLX90640 Sensor Fusion Monitor (°C)] ===\n");
-        for (int y = 0; y < 24; y += 3) {
-            for (int x = 0; x < 32; x += 4) {
-                float val = mlx90640_frame[y * 32 + x];
-                if (val >= current_temp_threshold) {
-                    printf("!%3.0f! ", val);
-                } else {
-                    printf(" %3.0f  ", val);
-                }
-            }
-            printf("\n");
-        }
-        printf("-----------------------------------------------------\n");
-        printf("[FUSION] Dynamic Target Temp: %.1f °C | Target Area: %d px\n", current_temp_threshold, current_area_threshold);
-        printf("[DATA] Gas: %d | Peak Temp: %.1f °C | Current Hot Area: %d px\n", mq_raw_value, max_temp, high_temp_pixel_count);
-        printf("[DIAG] Safety Status: %s\n", hybrid_fire_triggered ? "!! DANGER (TRIGGERED) !!" : "SAFE (MONITORING)");
-        printf("-----------------------------------------------------\n");
-
-        // PC 시각화 및 데이터 로깅용 구조화 출력 (Python 수신 파서 대상)
-        // 포맷: $DATA,<tick_ms>,<mq>,<max_temp>,<hot_pixels>,<fire>,<t0>,...<t767>
-        printf("$DATA,%lu,%d,%.2f,%d,%d",
-               (unsigned long)xTaskGetTickCount(),
+        printf("[FUSION] Thresh=%.1f°C Area=%dpx | Gas=%d Peak=%.1f°C Hot=%dpx | %s\n",
+               current_temp_threshold, current_area_threshold,
                mq_raw_value, max_temp, high_temp_pixel_count,
-               (int)hybrid_fire_triggered);
+               hybrid_fire_triggered ? "!! FIRE !!" : "SAFE");
+
+        // PC 열화상 모니터 전송 — 컴팩트 hex 포맷 (참조: GY-MCU90640 프로토콜)
+        // $H,<tick_ms>,<mq>,<maxtemp*100>,<hot_pixels>,<fire>,<3072 hex chars (768 x int16 x 100)>
+        // %04X = big-endian hex, PC에서 dtype='>i2' 로 파싱, 총 ~3130자 @ 115200bps = 0.27초
+        printf("$H,%lu,%d,%d,%d,%d,",
+               (unsigned long)xTaskGetTickCount(),
+               mq_raw_value, (int)(max_temp * 100.0f),
+               high_temp_pixel_count, (int)hybrid_fire_triggered);
         for (int i = 0; i < 768; i++) {
-            printf(",%.2f", mlx90640_frame[i]);
+            int16_t v = (int16_t)(mlx90640_frame[i] * 100.0f);
+            printf("%04X", (uint16_t)v);
         }
         printf("\n");
 
