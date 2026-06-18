@@ -158,6 +158,11 @@ bool move_reverse_with_mon(int32_t max_steps) {
         ets_delay_us(MOTOR_PULSE_DELAY_US);
         actual_moved_steps++;
 
+        // [안전장치] 약 80ms마다 한 번씩 CPU를 양보하여 Watchdog 패닉을 방지합니다.
+        if (i % 100 == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
         if (gpio_get_level(PIN_EMERGENCY_SWITCH) == 0) {
             stop_requested = true;
             break;
@@ -169,15 +174,18 @@ bool move_reverse_with_mon(int32_t max_steps) {
 // 비상 전개(DIR=0): 리프트 상승 → 수조가 차량을 덮음
 // 전체 이동 거리의 1/3 지점에서 펌프 릴레이 기동 (PUL 루프 정지 후 전환 → EMI 간섭 방지)
 void move_emergency_return(int32_t steps_to_return) {
-    if (steps_to_return <= 0) steps_to_return = max_target_steps;
+    if (steps_to_return <= 0)
+        steps_to_return = max_target_steps;
     ESP_LOGE(TAG, "[!] 비상 전개 개시 ➡️ 목표 스텝: %ld", steps_to_return);
 
     gpio_set_level(PIN_MOTOR_DIR, 0);
     vTaskDelay(pdMS_TO_TICKS(200));
 
     int32_t trigger_point = steps_to_return / 3;
-    if (trigger_point < 50) trigger_point = 50;
-    if (trigger_point > steps_to_return) trigger_point = steps_to_return;
+    if (trigger_point < 50)
+        trigger_point = 50;
+    if (trigger_point > steps_to_return)
+        trigger_point = steps_to_return;
 
     // [1단계] 0 → 1/3 구간 (펌프 OFF)
     for (int32_t i = 0; i < trigger_point; i++) {
@@ -185,6 +193,11 @@ void move_emergency_return(int32_t steps_to_return) {
         ets_delay_us(MOTOR_PULSE_DELAY_US);
         gpio_set_level(PIN_MOTOR_PUL, 0);
         ets_delay_us(MOTOR_PULSE_DELAY_US);
+
+        // [안전장치] Watchdog 패닉 방지
+        if (i % 100 == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
 
     // 1/3 지점 도달: 루프 정지 상태에서 릴레이 기동
@@ -199,12 +212,18 @@ void move_emergency_return(int32_t steps_to_return) {
         ets_delay_us(MOTOR_PULSE_DELAY_US);
         gpio_set_level(PIN_MOTOR_PUL, 0);
         ets_delay_us(MOTOR_PULSE_DELAY_US);
+
+        // [안전장치] Watchdog 패닉 방지
+        if (i % 100 == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
 }
 
 // 수조 원위치 복귀(DIR=1): 리프트 하강 → 내려가는 순간 즉시 펌프 차단
 void move_forward_return(int32_t steps_to_return) {
-    if (steps_to_return <= 0) steps_to_return = max_target_steps;
+    if (steps_to_return <= 0)
+        steps_to_return = max_target_steps;
     gpio_set_level(PIN_COOLING_PUMP, 0); // 하강 시작 즉시 펌프 차단
     ESP_LOGE(TAG, "[!] 원위치 복귀 개시 ➡️ 목표 스텝: %ld", steps_to_return);
     gpio_set_level(PIN_MOTOR_DIR, 1);
@@ -214,6 +233,11 @@ void move_forward_return(int32_t steps_to_return) {
         ets_delay_us(MOTOR_PULSE_DELAY_US);
         gpio_set_level(PIN_MOTOR_PUL, 0);
         ets_delay_us(MOTOR_PULSE_DELAY_US);
+
+        // [안전장치] Watchdog 패닉 방지
+        if (i % 100 == 0) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
     }
 }
 
