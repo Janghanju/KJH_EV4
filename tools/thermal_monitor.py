@@ -33,6 +33,7 @@ try:
     import matplotlib.font_manager as _fm
     import matplotlib.gridspec as gridspec
     import numpy as np
+    from PIL import Image, ImageTk
 
     _KO = next(
         (f for f in ["Apple SD Gothic Neo", "AppleGothic",
@@ -43,7 +44,7 @@ try:
         matplotlib.rcParams["font.family"] = _KO
     matplotlib.rcParams["axes.unicode_minus"] = False
 except ImportError:
-    _miss.append("matplotlib  numpy")
+    _miss.append("matplotlib  numpy  pillow")
 
 try:
     import serial
@@ -101,7 +102,9 @@ class App:
         self.last_fire    = False
         self._fps_cnt     = 0
         self._fps_ts      = datetime.now().timestamp()
-        self._frame_t0    = _time.time()  # FPS 계산용
+        self._frame_t0    = _time.time()
+        self._last_render = 0.0     # matplotlib 렌더 타임스탬프 (쓰로틀용)
+        self._pending     = None    # 다음 캔버스 렌더 대기 데이터
 
         # 그래프 히스토리
         self.ht: list = []
@@ -118,6 +121,7 @@ class App:
         self._build_main()       # pack FILL/EXPAND last
 
         self._tick()
+        self._draw_tick()
 
     # =========================================================================
     # 1. 툴바 (포트·연결·저장경로·CSV)
@@ -206,44 +210,50 @@ class App:
         self._build_status(right)
         self._build_graphs(right)
 
-    # ── 열화상 패널 ──────────────────────────────────────────────────────────
+    # ── 열화상 패널 (PIL/PhotoImage — matplotlib 불필요, CPU 저부하) ─────────
     def _build_thermal(self, parent):
-        self._lb(parent, "MLX90640 열화상  (32 × 24 pixels)",
+        self._lb(parent, "MLX90640 열화상  (32 × 24 → 320 × 240)",
                  size=11, color=CYN, bold=True).pack(pady=(0, 4))
 
-        self.fig_th = Figure(figsize=(6.2, 5.2), facecolor=BG)
-        self.ax_th  = self.fig_th.add_subplot(111)
-        self.ax_th.set_facecolor(MID)
+        # 열화상 이미지 표시용 Label (PIL PhotoImage)
+        self._th_photo  = None          # 가비지컬렉션 방지용 레퍼런스
+        self.thermal_lbl = tk.Label(parent, bg=BG, cursor="crosshair")
+        self.thermal_lbl.pack(fill=tk.BOTH, expand=True)
 
-        self.im = self.ax_th.imshow(
-            np.full((ROWS, COLS), 25.0),
-            cmap="inferno", vmin=20, vmax=80,
-            aspect="auto", interpolation="bicubic"  # 참조 구현처럼 부드러운 보간
-        )
+        # 오버레이 정보 바 (최고온도 + FPS)
+        info_bar = tk.Frame(parent, bg=DRK, pady=3)
+        info_bar.pack(fill=tk.X)
+        self.th_info = tk.Label(info_bar,
+            text="Tmin=-- Tmax=-- Pos=(-,-) FPS=--",
+            bg=DRK, fg=CYN, font=("Courier New", 9))
+        self.th_info.pack()
 
-        cb = self.fig_th.colorbar(self.im, ax=self.ax_th, fraction=0.04, pad=0.02)
-        cb.set_label("°C", color=WHT, fontsize=9)
-        cb.ax.yaxis.set_tick_params(color=WHT, labelsize=7)
-        for t in cb.ax.yaxis.get_ticklabels():
-            t.set_color(WHT)
+        # 초기 placeholder 이미지 생성
+        self._draw_placeholder()
 
-        self.ax_th.set_xlabel("Column (픽셀)", color=WHT, fontsize=8)
-        self.ax_th.set_ylabel("Row (픽셀)",    color=WHT, fontsize=8)
-        self.ax_th.tick_params(colors=WHT, labelsize=7)
-        for sp in self.ax_th.spines.values():
-            sp.set_edgecolor("#444")
+    def _draw_placeholder(self):
+        """연결 전 표시할 기본 열화상 이미지"""
+        arr = np.full((ROWS, COLS), 25.0, dtype=np.float32)
+        self._th_photo = self._arr_to_photo(arr)
+        self.thermal_lbl.configure(image=self._th_photo)
 
-        # 최고온도 위치 표시
-        self.ch_h = self.ax_th.axhline(0, color="cyan", lw=1.0, ls="--", alpha=0.8)
-        self.ch_v = self.ax_th.axvline(0, color="cyan", lw=1.0, ls="--", alpha=0.8)
-        self.hot_txt = self.ax_th.text(1, 1, "", color="cyan", fontsize=9,
-                                        fontweight="bold",
-                                        bbox=dict(fc=BG, alpha=0.75, pad=2))
+    @staticmethod
+    def _arr_to_photo(arr: np.ndarray, width: int = 320, height: int = 240):
+        """온도 배열 → PIL PhotoImage (inferno 색상표, bicubic 확대)"""
+        lo, hi = float(arr.min()), float(arr.max())
+        if hi - lo < 1.0:
+            lo -= 5.0; hi += 5.0
+        norm = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)   # 0~1
 
-        canvas = FigureCanvasTkAgg(self.fig_th, master=parent)
-        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        self.canvas_th = canvas
-        self.fig_th.tight_layout(pad=1.2)
+        # inferno 색상표 근사 (matplotlib inferno 팔레트 핵심 색상)
+        r = np.clip(norm * 2.5,       0, 1)
+        g = np.clip(norm * 2.5 - 1.0, 0, 1)
+        b = np.clip(1.0 - norm * 2.0, 0, 1)
+        rgb = (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
+
+        img = Image.fromarray(rgb.astype(np.uint8))
+        img = img.resize((width, height), Image.BICUBIC)
+        return ImageTk.PhotoImage(img)
 
     # ── 상태 패널 ────────────────────────────────────────────────────────────
     def _build_status(self, parent):
@@ -643,7 +653,9 @@ class App:
             return None
 
     # =========================================================================
-    # 9. 200ms 렌더링 루프
+    # 9. 렌더링 루프
+    #    _tick()       200ms — 빠른 label/CSV 업데이트
+    #    _draw_tick()  500ms — 무거운 matplotlib 캔버스 렌더 (CPU 분산)
     # =========================================================================
     def _tick(self):
         try:
@@ -657,7 +669,9 @@ class App:
                     break
 
             if data:
-                self._render(data)
+                self._update_labels(data)   # 빠른 tkinter label 갱신
+                self._save_csv(data)        # CSV 즉시 저장
+                self._pending = data        # matplotlib는 _draw_tick에서 처리
 
             now = datetime.now().timestamp()
             if now - self._fps_ts >= 1.0:
@@ -669,7 +683,6 @@ class App:
             self.frame_lbl.configure(
                 text=f"프레임: {self.frame_count}  |  드롭: {self.drop_count}")
         except Exception as e:
-            # 에러를 로그에 표시 (silent swallow 금지)
             try:
                 self._log(f"[tick error] {e}", "warn")
             except Exception:
@@ -677,27 +690,23 @@ class App:
         finally:
             self.root.after(200, self._tick)
 
-    def _render(self, d: dict):
-        # ── 열화상 업데이트 (참조 구현처럼 int16→float 배열 직접 렌더) ──────
-        arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
+    def _draw_tick(self):
+        """matplotlib 렌더 전용 루프 (500ms) — CPU 과부하 방지"""
+        try:
+            d = self._pending
+            if d is not None:
+                self._pending = None
+                self._render_canvas(d)
+        except Exception as e:
+            try:
+                self._log(f"[draw error] {e}", "warn")
+            except Exception:
+                pass
+        finally:
+            self.root.after(500, self._draw_tick)
 
-        # 동적 범위: 실제 min/max 기반 (참조 구현의 Tmin/Tmax 고정 대신 자동)
-        lo = float(arr.min())
-        hi = float(arr.max())
-        if hi - lo < 1.0:          # 차이가 너무 작으면 ±5 여유 추가
-            lo -= 5.0; hi += 5.0
-        self.im.set_data(arr)
-        self.im.set_clim(lo, hi)
-
-        # 최고온도 위치 십자선 + 오버레이
-        r, c = divmod(int(arr.argmax()), COLS)
-        self.ch_h.set_ydata([r])
-        self.ch_v.set_xdata([c])
-        self.hot_txt.set_position((min(c + 0.5, COLS - 5), max(r - 0.8, 0.5)))
-        self.hot_txt.set_text(f"{arr[r, c]:.1f}°C")
-        self.canvas_th.draw_idle()
-
-        # ── 화재 상태 ──────────────────────────────────────────────────────────
+    def _update_labels(self, d: dict):
+        """빠른 tkinter 위젯 갱신 (matplotlib 렌더 없음)"""
         is_fire = d["fire"]
         self.fire_lbl.configure(
             text="🔥  FIRE !!" if is_fire else "✔  SAFE",
@@ -708,7 +717,6 @@ class App:
                 "fire")
         self.last_fire = is_fire
 
-        # ── 수치 패널 ──────────────────────────────────────────────────────────
         self.metrics["max_temp"].configure(
             text=f"{d['max_temp']:.1f} °C",
             fg=RED if d["max_temp"] >= 75 else WHT)
@@ -719,7 +727,6 @@ class App:
             text=str(d["mq"]),
             fg=RED if d["mq"] >= 1200 else ORG if d["mq"] >= 300 else WHT)
 
-        # ── 수신 데이터 바 ─────────────────────────────────────────────────────
         self.dlbl["tick"].configure(text=str(d["tick_ms"]))
         self.dlbl["mq"].configure(
             text=str(d["mq"]) if d["mq"] else
@@ -734,7 +741,30 @@ class App:
             text=f"{self.frame_count}"
                  + (f"  {d['fps_bin']:.1f}fps" if "fps_bin" in d else ""))
 
-        # ── 시계열 그래프 ─────────────────────────────────────────────────────
+    def _render_canvas(self, d: dict):
+        """열화상 PIL 렌더 + 그래프 matplotlib 렌더"""
+        arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
+        r_max, c_max = divmod(int(arr.argmax()), COLS)
+
+        # ── 열화상: PIL PhotoImage (매우 빠름) ───────────────────────────────
+        try:
+            w = self.thermal_lbl.winfo_width()
+            h = self.thermal_lbl.winfo_height()
+            if w < 32 or h < 32:
+                w, h = 320, 240
+            self._th_photo = self._arr_to_photo(arr, w, h)
+            self.thermal_lbl.configure(image=self._th_photo)
+        except Exception:
+            pass
+
+        # 오버레이 정보 업데이트
+        fps = d.get("fps_bin", 0)
+        fps_str = f" FPS={fps:.1f}" if fps else ""
+        self.th_info.configure(
+            text=f"Tmin={arr.min():.1f}°C  Tmax={arr.max():.1f}°C"
+                 f"  HotPos=({c_max},{r_max}){fps_str}")
+
+        # ── 시계열 그래프 (matplotlib, 500ms 호출) ───────────────────────────
         t = d["tick_ms"] / 1000.0
         self.ht.append(t)
         self.htemp.append(d["max_temp"])
@@ -750,20 +780,22 @@ class App:
         self.ln_mq.set_data(self.ht, self.hmq)
         self.ax_mq.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0] + 1))
         self.ax_mq.set_ylim(0, max(1500, max(self.hmq) + 100))
-        self.canvas_g.draw_idle()
+        self.canvas_g.draw_idle()   # 그래프만 matplotlib
 
-        # ── CSV 저장 ──────────────────────────────────────────────────────────
-        if self.csv_writer:
-            ambient = d.get("ambient", "")
-            row = [d["ts"], d["tick_ms"], d["mq"],
-                   f"{d['max_temp']:.2f}", d["hot_pixels"], int(d["fire"]),
-                   f"{ambient:.2f}" if ambient != "" else ""]
-            row += [f"{v:.2f}" for v in d["pixels"]]
-            try:
-                self.csv_writer.writerow(row)
-                self.csv_file.flush()
-            except Exception as e:
-                self._log(f"[CSV error] {e}", "warn")
+    def _save_csv(self, d: dict):
+        """CSV 한 행 저장"""
+        if not self.csv_writer:
+            return
+        ambient = d.get("ambient", "")
+        row = [d["ts"], d["tick_ms"], d["mq"],
+               f"{d['max_temp']:.2f}", d["hot_pixels"], int(d["fire"]),
+               f"{ambient:.2f}" if ambient != "" else ""]
+        row += [f"{v:.2f}" for v in d["pixels"]]
+        try:
+            self.csv_writer.writerow(row)
+            self.csv_file.flush()
+        except Exception as e:
+            self._log(f"[CSV error] {e}", "warn")
 
     # =========================================================================
     # 유틸
@@ -805,6 +837,15 @@ class App:
 
 # ─── 진입점 ──────────────────────────────────────────────────────────────────
 def main():
+    import argparse
+    ap = argparse.ArgumentParser(description="KJH_EV4 열화상 모니터")
+    ap.add_argument("--port",  default="",
+                    help="시리얼 포트 자동 연결 (예: /dev/cu.usbmodem...)")
+    ap.add_argument("--mode",  default="자동 감지",
+                    choices=["자동 감지", "GY-MCU90640 직접", "ESP32 릴레이"],
+                    help="연결 모드")
+    args = ap.parse_args()
+
     print("KJH_EV4 열화상 모니터 시작 중...", flush=True)
     root = tk.Tk()
     app  = App(root)
@@ -816,7 +857,15 @@ def main():
     root.after(200, lambda: root.attributes("-topmost", False))
     root.focus_force()
 
-    print("창 표시 완료 — ESP32 USB 연결 후 포트를 선택하세요.", flush=True)
+    # 명령줄 인수로 자동 연결
+    if args.port:
+        app.port_var.set(args.port)
+        app.mode_var.set(args.mode)
+        root.after(500, app._connect)   # 창이 완전히 뜬 뒤 연결
+        print(f"자동 연결: {args.port}  모드={args.mode}", flush=True)
+    else:
+        print("창 표시 완료 — 포트를 선택하고 ▶ 연결 버튼을 클릭하세요.", flush=True)
+
     root.mainloop()
     print("종료.", flush=True)
 
