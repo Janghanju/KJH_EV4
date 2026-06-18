@@ -440,13 +440,13 @@ class App:
                             self.data_q.put_nowait(data)
                         except queue.Empty:
                             pass
-                elif line.startswith("$H,"):
-                    # $H 라인인데 파싱 실패 → 잘린 라인
+                elif line.startswith("$H,") or line.startswith("$DATA,"):
+                    # 구조화 라인인데 파싱 실패 → 잘린 수신
                     self.parse_fail += 1
                     if self.parse_fail <= 5 or self.parse_fail % 50 == 0:
                         self.root.after(0, self._log,
-                            f"[parse FAIL #{self.parse_fail}] len={len(line)} "
-                            f"hex_len={len(line.split(',')[-1]) if ',' in line else 0}",
+                            f"[parse FAIL #{self.parse_fail}] fmt={'$H' if line.startswith('$H') else '$DATA'} "
+                            f"len={len(line)}",
                             "warn")
                 elif line and not line.startswith("$"):
                     # ESP32 일반 디버그 텍스트는 로그에 표시
@@ -461,23 +461,28 @@ class App:
     @staticmethod
     def _parse(line: str):
         """
-        $H 포맷 파싱 (컴팩트 hex 인코딩)
-        $H,<tick_ms>,<mq>,<maxtemp*100>,<hot_pixels>,<fire>,<3072 hex = 768×int16×100>
-        참조: GY-MCU90640 int16 little-endian × 100 온도값
+        두 가지 ESP32 출력 포맷 모두 지원:
+          $H  포맷 (신): $H,tick,mq,maxtemp*100,hot,fire,<3072 hex>
+          $DATA 포맷 (구): $DATA,tick,mq,max_temp,hot,fire,t0,t1,...,t767
         """
-        if not line.startswith("$H,"):
-            return None
-        # 헤더 6 필드 + hex blob
+        if line.startswith("$H,"):
+            return App._parse_h(line)
+        if line.startswith("$DATA,"):
+            return App._parse_data(line)
+        return None
+
+    @staticmethod
+    def _parse_h(line: str):
+        """$H 컴팩트 hex 포맷 — ESP32 printf('%04X') = big-endian value"""
         p = line.split(",", 6)
         if len(p) < 7:
             return None
         try:
             hex_blob = p[6].strip()
-            if len(hex_blob) < NPIX * 4:   # 768 pixels × 4 hex chars
+            if len(hex_blob) < NPIX * 4:
                 return None
-            # 참조 구현과 동일: bytes → int16 LE → float / 100
             raw   = bytes.fromhex(hex_blob[:NPIX * 4])
-            arr16 = np.frombuffer(raw, dtype=">i2")      # int16 big-endian (printf %04X = MSB first)
+            arr16 = np.frombuffer(raw, dtype=">i2")   # big-endian (MSB first)
             pixels = (arr16.astype(np.float32) / 100.0).tolist()
             return {
                 "tick_ms":    int(p[1]),
@@ -488,7 +493,27 @@ class App:
                 "pixels":     pixels,
                 "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
             }
-        except (ValueError, IndexError, Exception):
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_data(line: str):
+        """$DATA 레거시 float 텍스트 포맷 (구 펌웨어 호환)"""
+        p = line.split(",")
+        if len(p) < 6 + NPIX:
+            return None
+        try:
+            pixels = [float(x) for x in p[6: 6 + NPIX]]
+            return {
+                "tick_ms":    int(p[1]),
+                "mq":         int(p[2]),
+                "max_temp":   float(p[3]),
+                "hot_pixels": int(p[4]),
+                "fire":       bool(int(p[5])),
+                "pixels":     pixels,
+                "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+            }
+        except Exception:
             return None
 
     # =========================================================================
@@ -544,7 +569,7 @@ class App:
         self.ch_v.set_xdata([c])
         self.hot_txt.set_position((min(c + 0.5, COLS - 5), max(r - 0.8, 0.5)))
         self.hot_txt.set_text(f"{arr[r, c]:.1f}°C")
-        self.canvas_th.draw()           # draw_idle 대신 draw() 로 즉시 갱신
+        self.canvas_th.draw_idle()
 
         # ── 화재 상태 ──────────────────────────────────────────────────────────
         is_fire = d["fire"]
@@ -595,7 +620,7 @@ class App:
         self.ln_mq.set_data(self.ht, self.hmq)
         self.ax_mq.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0] + 1))
         self.ax_mq.set_ylim(0, max(1500, max(self.hmq) + 100))
-        self.canvas_g.draw()            # 즉시 갱신
+        self.canvas_g.draw_idle()
 
         # ── CSV 저장 ──────────────────────────────────────────────────────────
         if self.csv_writer:
