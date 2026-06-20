@@ -19,7 +19,7 @@ echo "Python: $($PY --version)"
 echo ""
 
 $PY -m pip install --upgrade pip
-$PY -m pip install pyserial matplotlib numpy Pillow
+$PY -m pip install pyserial matplotlib numpy Pillow "imageio[ffmpeg]"
 
 echo ""
 echo "========================================"

@@ -114,9 +114,9 @@ class App:
         self._last_render = 0.0
         self._pending     = None    # 다음 캔버스 렌더 대기 데이터
         self._th_photo    = None    # ImageTk.PhotoImage 단일 인스턴스 (재사용)
-        self._th_w        = 0       # 현재 PhotoImage 너비 (크기 변경 시만 재생성)
+        self._th_w        = 0
         self._th_h        = 0
-        self._gc_ts       = _time.time()  # 마지막 gc.collect() 시각
+        self._gc_ts       = _time.time()
 
         # 그래프 히스토리
         self.ht: list = []
@@ -125,8 +125,15 @@ class App:
 
         # CSV 저장 경로 / 로테이션
         self.save_dir       = tk.StringVar(value=DEFAULT_DIR)
-        self.csv_interval   = tk.StringVar(value="없음")   # 파일 로테이션 간격
-        self._csv_open_ts   = 0.0    # 현재 CSV 파일 오픈 시각
+        self.csv_interval   = tk.StringVar(value="없음")
+        self._csv_open_ts   = 0.0
+        self._last_csv_ts   = 0.0    # 마지막 CSV 행 저장 시각 (1초 제한)
+
+        # 이미지 캡처 / 영상
+        self.cap_var        = tk.BooleanVar(value=True)   # 캡처 활성화 토글
+        self._cap_dir       = ""      # 캡처 JPEG 저장 경로
+        self._last_cap_ts   = 0.0    # 마지막 캡처 시각
+        self._cap_frames: list = []  # 영상용 PIL Image 버퍼 (최대 7200장)
 
         # UI 구성 — 순서 중요: BOTTOM 요소를 먼저 pack
         self._build_log()        # pack BOTTOM 1st
@@ -134,8 +141,9 @@ class App:
         self._build_toolbar()    # pack TOP
         self._build_main()       # pack FILL/EXPAND last
 
-        self._tick()
-        self._draw_tick()
+        self._tick()          # 100ms: labels + CSV + capture
+        self._thermal_tick()  # 250ms: 열화상 이미지만 (빠른 FPS)
+        self._graph_tick()    # 2000ms: matplotlib 그래프 (무거운 렌더)
 
     # =========================================================================
     # 1. 툴바 (포트·연결·저장경로·CSV)
@@ -181,12 +189,12 @@ class App:
 
         self._vsep(bar)
 
-        # ── CSV 토글 + 파일 로테이션 간격 ──────────────────────────────────
+        # ── CSV 자동저장 + 파일 분할 + 이미지 캡처 ─────────────────────────
         self.csv_var = tk.BooleanVar(value=True)
         tk.Checkbutton(bar, text="CSV 자동저장", variable=self.csv_var,
                        bg=MID, fg=WHT, activebackground=MID,
                        activeforeground=WHT, selectcolor=ACC,
-                       font=("Helvetica", 9)).pack(side=tk.LEFT, padx=(0, 4))
+                       font=("Helvetica", 9)).pack(side=tk.LEFT, padx=(0, 3))
 
         self._lb(bar, "분할:", size=8, color="#888").pack(side=tk.LEFT, padx=(0, 2))
         intvl_menu = tk.OptionMenu(bar, self.csv_interval,
@@ -195,7 +203,17 @@ class App:
                              font=("Helvetica", 8), relief="flat",
                              highlightthickness=0, width=4)
         intvl_menu["menu"].configure(bg=PNL, fg=WHT)
-        intvl_menu.pack(side=tk.LEFT, padx=(0, 8))
+        intvl_menu.pack(side=tk.LEFT, padx=(0, 6))
+
+        self._vsep(bar)
+
+        tk.Checkbutton(bar, text="📸 이미지 캡처", variable=self.cap_var,
+                       bg=MID, fg=WHT, activebackground=MID,
+                       activeforeground=WHT, selectcolor=ACC,
+                       font=("Helvetica", 9)).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._btn(bar, "🎬 영상 저장", self._save_video,
+                  bg="#2c3e50").pack(side=tk.LEFT, padx=(0, 6))
 
         # ── 오른쪽: 상태 표시 ───────────────────────────────────────────────
         self.frame_lbl = self._lb(bar, "프레임: 0  |  드롭: 0",
@@ -270,9 +288,9 @@ class App:
             g = np.clip(norm * 2.5 - 1.0, 0, 1)
             b = np.clip(1.0 - norm * 2.0, 0, 1)
             rgb = (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
-        # 해상도 상한 640×480 (1MB 이내)
-        w = min(width,  640)
-        h = min(height, 480)
+        # 최소 32px, 최대 1920×1080 가드 (창 크기에 자동 맞춤)
+        w = max(32, min(width,  1920))
+        h = max(32, min(height, 1080))
         return Image.fromarray(rgb).resize((w, h), Image.BILINEAR)
 
     def _update_thermal_label(self, arr: np.ndarray, w: int, h: int):
@@ -483,25 +501,30 @@ class App:
     # 7. CSV 관리
     # =========================================================================
     def _init_csv(self):
-        # 기존 파일 닫기
         if self.csv_file:
             try:
                 self.csv_file.close()
             except Exception:
                 pass
-        d = self.save_dir.get()
+        d    = self.save_dir.get()
         os.makedirs(d, exist_ok=True)
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         mode = "bin" if self.binary_mode else "esp"
         fp   = os.path.join(d, f"thermal_{mode}_{ts}.csv")
-        self.csv_file       = open(fp, "w", newline="", encoding="utf-8")
-        self._csv_open_ts   = _time.time()
+        self.csv_file     = open(fp, "w", newline="", encoding="utf-8")
+        self._csv_open_ts = _time.time()
+        self._last_csv_ts = 0.0     # 새 파일 시작 시 즉시 첫 행 기록
         hdr = ["timestamp", "tick_ms", "mq_raw", "max_temp_c",
                "hot_pixels", "fire_triggered", "ambient_c"]
         hdr += [f"t{i:03d}" for i in range(NPIX)]
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(hdr)
         self._log(f"CSV 시작: {fp}", "info")
+
+        # 이미지 캡처 디렉토리 (CSV와 같은 폴더 아래 frames/)
+        self._cap_dir = os.path.join(d, f"frames_{ts}")
+        os.makedirs(self._cap_dir, exist_ok=True)
+        self._last_cap_ts = 0.0
 
     def _browse_dir(self):
         d = filedialog.askdirectory(initialdir=self.save_dir.get(),
@@ -695,9 +718,10 @@ class App:
             return None
 
     # =========================================================================
-    # 9. 렌더링 루프
-    #    _tick()       200ms — 빠른 label/CSV 업데이트
-    #    _draw_tick()  500ms — 무거운 matplotlib 캔버스 렌더 (CPU 분산)
+    # 9. 렌더링 루프 (3-tier 분리)
+    #    _tick()        100ms  — labels + CSV(1/sec) + capture(1/sec) + GC(5/sec)
+    #    _thermal_tick() 250ms  — 열화상 PIL 이미지만 (≈4 FPS)
+    #    _graph_tick()  2000ms — matplotlib 그래프 (무거운 렌더)
     # =========================================================================
     def _tick(self):
         try:
@@ -711,25 +735,26 @@ class App:
                     break
 
             if data:
-                self._update_labels(data)   # 빠른 tkinter label 갱신
-                self._save_csv(data)        # CSV 즉시 저장
-                self._pending = data        # matplotlib는 _draw_tick에서 처리
+                self._update_labels(data)
+                self._save_csv(data)        # 내부에서 1초 rate-limit
+                self._capture_frame(data)   # 내부에서 1초 rate-limit
+                self._pending = data        # thermal_tick이 열화상 렌더
 
-            now = datetime.now().timestamp()
-            if now - self._fps_ts >= 1.0:
-                fps = self._fps_cnt / max(now - self._fps_ts, 0.001)
+            now_ts = _time.time()
+            now_dt = now_ts
+
+            if now_dt - self._fps_ts >= 1.0:
+                fps = self._fps_cnt / max(now_dt - self._fps_ts, 0.001)
                 self.metrics["fps"].configure(text=f"{fps:.1f} fps")
                 self._fps_cnt = 0
-                self._fps_ts  = now
+                self._fps_ts  = now_dt
 
             self.frame_lbl.configure(
-                text=f"프레임: {self.frame_count}  |  드롭: {self.drop_count}")
+                text=f"프레임: {self.frame_count}  |  캡처: {len(self._cap_frames)}")
 
-            # 5초마다 GC 강제 실행 + 로그 패널 트리밍 (300줄 상한)
-            now_t = _time.time()
-            if now_t - self._gc_ts >= 5.0:
+            if now_ts - self._gc_ts >= 5.0:
                 gc.collect()
-                self._gc_ts = now_t
+                self._gc_ts = now_ts
                 self._trim_log()
         except Exception as e:
             try:
@@ -737,22 +762,59 @@ class App:
             except Exception:
                 pass
         finally:
-            self.root.after(200, self._tick)
+            self.root.after(100, self._tick)
 
-    def _draw_tick(self):
-        """matplotlib 렌더 전용 루프 (1000ms) — 그래프 초당 1회 갱신"""
+    def _thermal_tick(self):
+        """열화상 이미지 전용 루프 (250ms ≈ 4 FPS) — PIL 렌더만"""
         try:
             d = self._pending
             if d is not None:
-                self._pending = None
-                self._render_canvas(d)
+                arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
+                r_max, c_max = divmod(int(arr.argmax()), COLS)
+                try:
+                    w = self.thermal_lbl.winfo_width()
+                    h = self.thermal_lbl.winfo_height()
+                    if w < 32 or h < 32:
+                        w, h = 320, 240
+                    self._update_thermal_label(arr, w, h)
+                except Exception as e:
+                    self._log(f"[thermal render] {e}", "warn")
+                fps_str = f" FPS={d.get('fps_bin',0):.1f}" if "fps_bin" in d else ""
+                self.th_info.configure(
+                    text=f"Tmin={arr.min():.1f}°C  Tmax={arr.max():.1f}°C"
+                         f"  HotPos=({c_max},{r_max}){fps_str}")
+        except Exception:
+            pass
+        finally:
+            self.root.after(250, self._thermal_tick)
+
+    def _graph_tick(self):
+        """matplotlib 그래프 전용 루프 (2000ms) — 무거운 렌더 분리"""
+        try:
+            d = self._pending
+            if d is not None:
+                t = d["tick_ms"] / 1000.0
+                self.ht.append(t)
+                self.htemp.append(d["max_temp"])
+                self.hmq.append(d["mq"])
+                for lst in (self.ht, self.htemp, self.hmq):
+                    if len(lst) > MAX_HIST:
+                        del lst[:-MAX_HIST]
+                self.ln_temp.set_data(self.ht, self.htemp)
+                self.ax_temp.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0]+1))
+                self.ax_temp.set_ylim(max(0, min(self.htemp)-5),
+                                      max(100, max(self.htemp)+5))
+                self.ln_mq.set_data(self.ht, self.hmq)
+                self.ax_mq.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0]+1))
+                self.ax_mq.set_ylim(0, max(1500, max(self.hmq)+100))
+                self.canvas_g.draw_idle()
         except Exception as e:
             try:
-                self._log(f"[draw error] {e}", "warn")
+                self._log(f"[graph error] {e}", "warn")
             except Exception:
                 pass
         finally:
-            self.root.after(1000, self._draw_tick)
+            self.root.after(2000, self._graph_tick)
 
     def _update_labels(self, d: dict):
         """빠른 tkinter 위젯 갱신 (matplotlib 렌더 없음)"""
@@ -790,59 +852,26 @@ class App:
             text=f"{self.frame_count}"
                  + (f"  {d['fps_bin']:.1f}fps" if "fps_bin" in d else ""))
 
-    def _render_canvas(self, d: dict):
-        """열화상 PIL 렌더 + 그래프 matplotlib 렌더"""
-        arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
-        r_max, c_max = divmod(int(arr.argmax()), COLS)
-
-        # ── 열화상: in-place PhotoImage 업데이트 ─────────────────────────────
-        try:
-            w = self.thermal_lbl.winfo_width()
-            h = self.thermal_lbl.winfo_height()
-            if w < 32 or h < 32:
-                w, h = 320, 240
-            self._update_thermal_label(arr, w, h)
-        except Exception as e:
-            self._log(f"[render error] {e}", "warn")
-
-        # 오버레이 정보 업데이트
-        fps = d.get("fps_bin", 0)
-        fps_str = f" FPS={fps:.1f}" if fps else ""
-        self.th_info.configure(
-            text=f"Tmin={arr.min():.1f}°C  Tmax={arr.max():.1f}°C"
-                 f"  HotPos=({c_max},{r_max}){fps_str}")
-
-        # ── 시계열 그래프 (matplotlib, 500ms 호출) ───────────────────────────
-        t = d["tick_ms"] / 1000.0
-        self.ht.append(t)
-        self.htemp.append(d["max_temp"])
-        self.hmq.append(d["mq"])
-        for lst in (self.ht, self.htemp, self.hmq):
-            if len(lst) > MAX_HIST:
-                del lst[:-MAX_HIST]
-
-        self.ln_temp.set_data(self.ht, self.htemp)
-        self.ax_temp.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0] + 1))
-        self.ax_temp.set_ylim(max(0, min(self.htemp) - 5),
-                               max(100, max(self.htemp) + 5))
-        self.ln_mq.set_data(self.ht, self.hmq)
-        self.ax_mq.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0] + 1))
-        self.ax_mq.set_ylim(0, max(1500, max(self.hmq) + 100))
-        self.canvas_g.draw_idle()   # 그래프만 matplotlib
+    # _render_canvas 역할은 _thermal_tick / _graph_tick으로 분리됨 (레거시 호환용)
 
     def _save_csv(self, d: dict):
         """CSV 한 행 저장 + 인터벌 파일 로테이션"""
         if not self.csv_var.get():
             return
-        # ── 인터벌 로테이션 확인 ─────────────────────────────────────────────
+        # ── 1초 rate-limit: 정확히 1초에 1행 ──────────────────────────────
+        now = _time.time()
+        if now - self._last_csv_ts < 1.0:
+            return
+        self._last_csv_ts = now
+
+        # ── 인터벌 파일 로테이션 ────────────────────────────────────────────
         interval_str = self.csv_interval.get()
         interval_sec = {"1분": 60, "5분": 300, "10분": 600,
                         "30분": 1800, "60분": 3600}.get(interval_str, 0)
         if interval_sec and self.csv_file:
-            elapsed = _time.time() - self._csv_open_ts
-            if elapsed >= interval_sec:
+            if now - self._csv_open_ts >= interval_sec:
                 self._log(f"CSV 파일 분리 ({interval_str} 경과)", "info")
-                self._init_csv()        # 새 파일 시작
+                self._init_csv()
 
         if not self.csv_writer:
             return
@@ -856,6 +885,66 @@ class App:
             self.csv_file.flush()
         except Exception as e:
             self._log(f"[CSV error] {e}", "warn")
+
+    def _capture_frame(self, d: dict):
+        """1초마다 열화상 JPEG 캡처 + 영상용 버퍼 보관"""
+        if not self.cap_var.get() or not self._cap_dir:
+            return
+        now = _time.time()
+        if now - self._last_cap_ts < 1.0:
+            return
+        self._last_cap_ts = now
+        try:
+            arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
+            img = self._arr_to_pil(arr, 320, 240)
+            ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+            fname = os.path.join(self._cap_dir, f"frame_{ts}.jpg")
+            img.save(fname, "JPEG", quality=85)
+            # 영상용 버퍼 (최대 7200장 = 2시간 @ 1fps)
+            if len(self._cap_frames) < 7200:
+                self._cap_frames.append(img.copy())
+        except Exception as e:
+            self._log(f"[capture error] {e}", "warn")
+
+    def _save_video(self):
+        """캡처 프레임으로 MP4 영상 생성"""
+        if not self._cap_frames:
+            messagebox.showinfo("캡처 없음",
+                "캡처된 프레임이 없습니다.\n연결 후 '📸 이미지 캡처'를 활성화하세요.")
+            return
+        d  = self.save_dir.get()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs(d, exist_ok=True)
+        vpath = os.path.join(d, f"thermal_timelapse_{ts}.mp4")
+        try:
+            import imageio
+            writer = imageio.get_writer(vpath, fps=4, quality=7)
+            for img in self._cap_frames:
+                writer.append_data(np.array(img))
+            writer.close()
+            self._log(f"영상 저장 완료: {vpath}  ({len(self._cap_frames)}프레임)", "info")
+            messagebox.showinfo("영상 저장", f"저장 완료:\n{vpath}")
+        except ImportError:
+            # ffmpeg fallback
+            try:
+                import subprocess
+                frame_dir = self._cap_dir or d
+                result = subprocess.run(
+                    ["ffmpeg", "-y", "-framerate", "1",
+                     "-pattern_type", "glob", "-i",
+                     os.path.join(frame_dir, "frame_*.jpg"),
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", vpath],
+                    capture_output=True, text=True, timeout=60)
+                if result.returncode == 0:
+                    self._log(f"영상 저장(ffmpeg): {vpath}", "info")
+                    messagebox.showinfo("영상 저장", f"저장 완료:\n{vpath}")
+                else:
+                    raise RuntimeError(result.stderr[:200])
+            except Exception as e:
+                self._log(f"[video error] imageio 미설치, ffmpeg 실패: {e}", "warn")
+                messagebox.showwarning("영상 저장 실패",
+                    "imageio 패키지 필요:\n  pip install imageio[ffmpeg]\n\n"
+                    f"JPEG 프레임은 {self._cap_dir} 에 저장되어 있습니다.")
 
     # =========================================================================
     # 유틸

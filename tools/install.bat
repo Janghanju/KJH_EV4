@@ -6,7 +6,7 @@ echo.
 
 REM python -m pip 방식 사용 (pip 명령이 없어도 동작)
 python -m pip install --upgrade pip
-python -m pip install pyserial matplotlib numpy Pillow
+python -m pip install pyserial matplotlib numpy Pillow imageio[ffmpeg]
 
 echo.
 echo ========================================
