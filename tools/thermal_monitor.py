@@ -275,7 +275,7 @@ class App:
     def _draw_placeholder(self):
         """연결 전 placeholder 렌더"""
         arr = np.full((ROWS, COLS), 25.0, dtype=np.float32)
-        self._update_thermal_label(arr, 320, 240)
+        self._update_thermal_label(arr)
 
     def _arr_to_pil(self, arr: np.ndarray, width: int = 640, height: int = 480) -> "Image.Image":
         lo = float(arr.min()); hi = float(arr.max())
