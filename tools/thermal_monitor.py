@@ -46,14 +46,16 @@ try:
         matplotlib.rcParams["font.family"] = _KO
     matplotlib.rcParams["axes.unicode_minus"] = False
     import matplotlib.cm as _cm
-    # get_cmap은 3.7+에서 deprecated → colormaps[] 우선 사용
     try:
-        _INFERNO = matplotlib.colormaps["inferno"]
+        _cmap = matplotlib.colormaps["inferno"]
     except AttributeError:
-        _INFERNO = _cm.get_cmap("inferno")
+        _cmap = _cm.get_cmap("inferno")
+    # 256-entry LUT (uint8 RGB) — 매 프레임 float64 RGBA 배열 생성 완전 제거
+    _LUT = (_cmap(np.linspace(0.0, 1.0, 256))[:, :3] * 255).astype(np.uint8)
+    del _cmap
 except ImportError:
     _miss.append("matplotlib  numpy  pillow")
-    _INFERNO = None
+    _LUT = None
 
 try:
     import serial
@@ -275,27 +277,26 @@ class App:
         arr = np.full((ROWS, COLS), 25.0, dtype=np.float32)
         self._update_thermal_label(arr, 320, 240)
 
-    def _arr_to_pil(self, arr: np.ndarray, width: int, height: int) -> "Image.Image":
+    def _arr_to_pil(self, arr: np.ndarray, width: int = 640, height: int = 480) -> "Image.Image":
         lo = float(arr.min()); hi = float(arr.max())
         if hi - lo < 1.0:
             lo -= 5.0; hi += 5.0
-        # _norm_buf: pre-allocated (24×32 float32) — 매 프레임 재할당 제거
+        # _norm_buf에 정규화 결과 in-place 저장 (재할당 없음)
         np.clip((arr - lo) / (hi - lo), 0.0, 1.0, out=self._norm_buf)
-        norm = self._norm_buf[:, ::-1]   # fliplr as a zero-copy view
-        if _INFERNO is not None:
-            rgba = _INFERNO(norm)                            # (24,32,4) float64
-            rgb  = (rgba[:, :, :3] * 255).astype(np.uint8)
+        norm = self._norm_buf[:, ::-1]   # fliplr as zero-copy view
+        if _LUT is not None:
+            # LUT 방식: float64 RGBA 배열 완전 제거 — uint8 인덱스(3KB) + 팬시 인덱싱만
+            idx = (norm * 255.0).clip(0, 255).astype(np.uint8)  # (24,32) uint8
+            rgb = _LUT[idx]                                       # (24,32,3) uint8
         else:
             r = np.clip(norm * 2.5,       0, 1)
             g = np.clip(norm * 2.5 - 1.0, 0, 1)
             b = np.clip(1.0 - norm * 2.0, 0, 1)
             rgb = (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
-        w = max(32, min(width,  1920))
-        h = max(32, min(height, 1080))
-        return Image.fromarray(rgb).resize((w, h), Image.BILINEAR)
+        return Image.fromarray(rgb).resize((width, height), Image.BILINEAR)
 
-    def _update_thermal_label(self, arr: np.ndarray, w: int, h: int):
-        img = self._arr_to_pil(arr, w, h)
+    def _update_thermal_label(self, arr: np.ndarray):
+        img = self._arr_to_pil(arr)
         iw, ih = img.size
         old = self._th_photo
         self._th_photo = ImageTk.PhotoImage(img)
@@ -776,11 +777,7 @@ class App:
                 hot_idx = int(arr.argmax())
                 r_max, c_max = divmod(hot_idx, COLS)
                 try:
-                    w = self.thermal_lbl.winfo_width()
-                    h = self.thermal_lbl.winfo_height()
-                    if w < 32 or h < 32:
-                        w, h = 320, 240
-                    self._update_thermal_label(arr, w, h)
+                    self._update_thermal_label(arr)   # 640×480 고정
                 except Exception as e:
                     self._log(f"[thermal render] {e}", "warn")
                 fps_str = f" FPS={d.get('fps_bin',0):.1f}" if "fps_bin" in d else ""
