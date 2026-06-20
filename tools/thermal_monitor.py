@@ -115,10 +115,8 @@ class App:
         self._fps_ts      = _time.time()
         self._frame_t0    = _time.time()
         self._pending     = None
-        # PhotoImage 재사용 — 크기 바뀔 때만 새로 생성
-        self._th_photo    = None
-        self._th_w        = 0
-        self._th_h        = 0
+        # PhotoImage: 최초 1회 생성 후 paste()로 픽셀만 갱신 (Tcl 힙 누적 없음)
+        self._th_photo = None
         self._gc_ts       = _time.time()
 
         # 열화상 렌더 전용 pre-allocated 버퍼 (프레임마다 ndarray 재할당 방지)
@@ -297,17 +295,13 @@ class App:
 
     def _update_thermal_label(self, arr: np.ndarray):
         img = self._arr_to_pil(arr)
-        iw, ih = img.size
-        old = self._th_photo
-        self._th_photo = ImageTk.PhotoImage(img)
-        self._th_w, self._th_h = iw, ih
-        self.thermal_lbl.configure(image=self._th_photo)
-        # label이 new_photo를 참조한 뒤 old 즉시 해제 → Tcl 리소스 누수 방지
-        if old is not None:
-            try:
-                old.__del__()
-            except Exception:
-                pass
+        if self._th_photo is None:
+            # 최초 1회만 PhotoImage 생성 — 이후 paste()로 픽셀만 갱신
+            self._th_photo = ImageTk.PhotoImage(img)
+            self.thermal_lbl.configure(image=self._th_photo)
+        else:
+            # Tcl 이미지 객체 재사용: alloc/dealloc 완전 없음 → Tcl 힙 누적 0
+            self._th_photo.paste(img)
 
     # ── 상태 패널 ────────────────────────────────────────────────────────────
     def _build_status(self, parent):
