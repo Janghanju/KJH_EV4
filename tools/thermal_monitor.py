@@ -297,21 +297,16 @@ class App:
     def _update_thermal_label(self, arr: np.ndarray, w: int, h: int):
         img = self._arr_to_pil(arr, w, h)
         iw, ih = img.size
-        if self._th_photo is not None and iw == self._th_w and ih == self._th_h:
-            # 크기 동일: PhotoImage를 재생성하지 않고 픽셀만 덮어씀
-            # → Tcl 리소스 alloc/dealloc 완전 제거 (매 250ms 할당 없음)
-            self._th_photo.paste(img)
-        else:
-            # 크기 변경 시에만 새 PhotoImage 생성
-            old = self._th_photo
-            self._th_photo = ImageTk.PhotoImage(img)
-            self._th_w, self._th_h = iw, ih
-            self.thermal_lbl.configure(image=self._th_photo)
-            if old is not None:
-                try:
-                    old.__del__()
-                except Exception:
-                    pass
+        old = self._th_photo
+        self._th_photo = ImageTk.PhotoImage(img)
+        self._th_w, self._th_h = iw, ih
+        self.thermal_lbl.configure(image=self._th_photo)
+        # label이 new_photo를 참조한 뒤 old 즉시 해제 → Tcl 리소스 누수 방지
+        if old is not None:
+            try:
+                old.__del__()
+            except Exception:
+                pass
 
     # ── 상태 패널 ────────────────────────────────────────────────────────────
     def _build_status(self, parent):
@@ -711,8 +706,7 @@ class App:
         if len(p) < 6 + NPIX:
             return None
         try:
-            pixels = np.fromiter((float(x) for x in p[6: 6 + NPIX]),
-                                 dtype=np.float32, count=NPIX)
+            pixels = np.array([float(x) for x in p[6: 6 + NPIX]], dtype=np.float32)
             return {
                 "tick_ms":    int(p[1]),
                 "mq":         int(p[2]),
@@ -883,16 +877,11 @@ class App:
         if not self.csv_writer:
             return
         ambient = d.get("ambient", "")
-        pix = d["pixels"]
-        # ndarray이면 numpy 벡터 포맷 (list comp 768회 f-string보다 빠름)
-        if isinstance(pix, np.ndarray):
-            pix_strs = list(np.char.mod("%.2f", pix))
-        else:
-            pix_strs = [f"{v:.2f}" for v in pix]
         row = [d["ts"], d["tick_ms"], d["mq"],
                f"{d['max_temp']:.2f}", d["hot_pixels"], int(d["fire"]),
                f"{ambient:.2f}" if ambient != "" else ""]
-        row += pix_strs
+        # ndarray와 list 모두 동일하게 처리 — iteration이 ndarray에서도 동작
+        row += [f"{v:.2f}" for v in d["pixels"]]
         try:
             self.csv_writer.writerow(row)
             self.csv_file.flush()
