@@ -19,7 +19,7 @@
 #define UART_PORT_NUM UART_NUM_2
 #define PIN_UART_RX 17 // GY-MCU90640 모듈 TX (ESP32-S3 RX2)
 #define PIN_UART_TX 18 // GY-MCU90640 모듈 RX (ESP32-S3 TX2)
-#define UART_BUF_SIZE 2048
+#define UART_BUF_SIZE 4096   // 1544×2=3088 바이트 이상 확보 (4Hz 버퍼 여유)
 
 #define ADC_MQ_CHANNEL ADC_CHANNEL_6 // GPIO 7번 (ADC1 단독 사용)
 
@@ -77,9 +77,14 @@ void init_uart_module(void) {
     ESP_ERROR_CHECK(uart_param_config(UART_PORT_NUM, &uart_config));
     ESP_ERROR_CHECK(uart_set_pin(UART_PORT_NUM, PIN_UART_TX, PIN_UART_RX, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    uint8_t cmd_auto_output[] = {0xA5, 0x15, 0xBA};
-    uart_write_bytes(UART_PORT_NUM, (const char *)cmd_auto_output, sizeof(cmd_auto_output));
-    ESP_LOGI(TAG, "GY-MCU90640 UART 통신 채널 스트리밍 개시.");
+    // GY-MCU90640 정확한 초기화 명령 (체크섬 = 하위바이트 합계)
+    // 이전 코드 {0xA5,0x15,0xBA}는 존재하지 않는 명령 → 센서 미응답(모든 픽셀 fallback 24°C)
+    uint8_t cmd_set_4hz[]  = {0xA5, 0x25, 0x01, 0xCB};  // 프레임 주기 4Hz 설정
+    uint8_t cmd_start_auto[] = {0xA5, 0x35, 0x02, 0xDC}; // 자동 연속 스트리밍 시작
+    uart_write_bytes(UART_PORT_NUM, (const char *)cmd_set_4hz,   sizeof(cmd_set_4hz));
+    vTaskDelay(pdMS_TO_TICKS(120));
+    uart_write_bytes(UART_PORT_NUM, (const char *)cmd_start_auto, sizeof(cmd_start_auto));
+    ESP_LOGI(TAG, "GY-MCU90640 4Hz 자동 스트리밍 시작 (0xA5 0x25 0x01 / 0xA5 0x35 0x02).");
 }
 
 void init_hardware(void) {
@@ -444,7 +449,7 @@ void vTaskSensorAndImageProcessing(void *pvParameters) {
         }
         printf("\n");
 
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(250));  // 4Hz 센서 주기(250ms) 에 맞춘 폴링
     }
 }
 

@@ -19,10 +19,14 @@ echo "Python: $($PY --version)"
 echo ""
 
 $PY -m pip install --upgrade pip
-$PY -m pip install pyserial matplotlib numpy
+$PY -m pip install pyserial matplotlib numpy Pillow
 
 echo ""
 echo "========================================"
 echo " 설치 완료! 아래 명령으로 실행하세요:"
+echo "   cd tools"
 echo "   $PY thermal_monitor.py"
+echo ""
+echo " 자동 연결 실행:"
+echo "   $PY thermal_monitor.py --port /dev/cu.usbmodem... --mode 'ESP32 릴레이'"
 echo "========================================"

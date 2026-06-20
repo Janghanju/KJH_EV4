@@ -43,8 +43,15 @@ try:
     if _KO:
         matplotlib.rcParams["font.family"] = _KO
     matplotlib.rcParams["axes.unicode_minus"] = False
+    import matplotlib.cm as _cm
+    # get_cmap은 3.7+에서 deprecated → colormaps[] 우선 사용
+    try:
+        _INFERNO = matplotlib.colormaps["inferno"]
+    except AttributeError:
+        _INFERNO = _cm.get_cmap("inferno")
 except ImportError:
     _miss.append("matplotlib  numpy  pillow")
+    _INFERNO = None
 
 try:
     import serial
@@ -111,8 +118,10 @@ class App:
         self.htemp: list = []
         self.hmq: list   = []
 
-        # CSV 저장 경로 변수
-        self.save_dir = tk.StringVar(value=DEFAULT_DIR)
+        # CSV 저장 경로 / 로테이션
+        self.save_dir       = tk.StringVar(value=DEFAULT_DIR)
+        self.csv_interval   = tk.StringVar(value="없음")   # 파일 로테이션 간격
+        self._csv_open_ts   = 0.0    # 현재 CSV 파일 오픈 시각
 
         # UI 구성 — 순서 중요: BOTTOM 요소를 먼저 pack
         self._build_log()        # pack BOTTOM 1st
@@ -175,12 +184,21 @@ class App:
 
         self._vsep(bar)
 
-        # ── CSV 토글 ────────────────────────────────────────────────────────
+        # ── CSV 토글 + 파일 로테이션 간격 ──────────────────────────────────
         self.csv_var = tk.BooleanVar(value=True)
         tk.Checkbutton(bar, text="CSV 자동저장", variable=self.csv_var,
                        bg=MID, fg=WHT, activebackground=MID,
                        activeforeground=WHT, selectcolor=ACC,
-                       font=("Helvetica", 9)).pack(side=tk.LEFT, padx=(0, 8))
+                       font=("Helvetica", 9)).pack(side=tk.LEFT, padx=(0, 4))
+
+        self._lb(bar, "분할:", size=8, color="#888").pack(side=tk.LEFT, padx=(0, 2))
+        intvl_menu = tk.OptionMenu(bar, self.csv_interval,
+                                   "없음", "1분", "5분", "10분", "30분", "60분")
+        intvl_menu.configure(bg=PNL, fg=WHT, activebackground=ACC,
+                             font=("Helvetica", 8), relief="flat",
+                             highlightthickness=0, width=4)
+        intvl_menu["menu"].configure(bg=PNL, fg=WHT)
+        intvl_menu.pack(side=tk.LEFT, padx=(0, 8))
 
         # ── 오른쪽: 상태 표시 ───────────────────────────────────────────────
         self.frame_lbl = self._lb(bar, "프레임: 0  |  드롭: 0",
@@ -217,8 +235,10 @@ class App:
 
         # 열화상 이미지 표시용 Label (PIL PhotoImage)
         self._th_photo  = None          # 가비지컬렉션 방지용 레퍼런스
-        self.thermal_lbl = tk.Label(parent, bg=BG, cursor="crosshair")
+        self.thermal_lbl = tk.Label(parent, bg=BG, cursor="crosshair",
+                                    anchor="nw")   # 이미지 좌상단 고정 (shift 방지)
         self.thermal_lbl.pack(fill=tk.BOTH, expand=True)
+        self.thermal_lbl.bind("<Configure>", self._on_thermal_resize)
 
         # 오버레이 정보 바 (최고온도 + FPS)
         info_bar = tk.Frame(parent, bg=DRK, pady=3)
@@ -237,21 +257,39 @@ class App:
         self._th_photo = self._arr_to_photo(arr)
         self.thermal_lbl.configure(image=self._th_photo)
 
+    def _on_thermal_resize(self, event):
+        """위젯 크기 변경 시 보류 중인 프레임으로 즉시 재렌더"""
+        if self._pending is not None:
+            d = self._pending
+            arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
+            w, h = max(event.width, 32), max(event.height, 32)
+            self._th_photo = self._arr_to_photo(arr, w, h)
+            self.thermal_lbl.configure(image=self._th_photo)
+
     @staticmethod
     def _arr_to_photo(arr: np.ndarray, width: int = 320, height: int = 240):
-        """온도 배열 → PIL PhotoImage (inferno 색상표, bicubic 확대)"""
+        """온도 배열 → PIL PhotoImage
+        - 실제 matplotlib inferno LUT (256색 정확도)
+        - 가로 flip: 참조 코드(Test.py) cv2.flip(img,1) 동일 처리
+        - bicubic 업스케일
+        """
         lo, hi = float(arr.min()), float(arr.max())
         if hi - lo < 1.0:
             lo -= 5.0; hi += 5.0
-        norm = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)   # 0~1
+        norm = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+        norm = np.fliplr(norm)                    # 가로 flip (참조코드와 동일)
 
-        # inferno 색상표 근사 (matplotlib inferno 팔레트 핵심 색상)
-        r = np.clip(norm * 2.5,       0, 1)
-        g = np.clip(norm * 2.5 - 1.0, 0, 1)
-        b = np.clip(1.0 - norm * 2.0, 0, 1)
-        rgb = (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
+        if _INFERNO is not None:
+            rgba = _INFERNO(norm)                 # (H, W, 4) float64
+            rgb  = (rgba[:, :, :3] * 255).astype(np.uint8)
+        else:
+            # fallback: 단순 근사
+            r = np.clip(norm * 2.5,       0, 1)
+            g = np.clip(norm * 2.5 - 1.0, 0, 1)
+            b = np.clip(1.0 - norm * 2.0, 0, 1)
+            rgb = (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
-        img = Image.fromarray(rgb.astype(np.uint8))
+        img = Image.fromarray(rgb)
         img = img.resize((width, height), Image.BICUBIC)
         return ImageTk.PhotoImage(img)
 
@@ -448,12 +486,19 @@ class App:
     # 7. CSV 관리
     # =========================================================================
     def _init_csv(self):
+        # 기존 파일 닫기
+        if self.csv_file:
+            try:
+                self.csv_file.close()
+            except Exception:
+                pass
         d = self.save_dir.get()
         os.makedirs(d, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         mode = "bin" if self.binary_mode else "esp"
-        fp  = os.path.join(d, f"thermal_{mode}_{ts}.csv")
-        self.csv_file   = open(fp, "w", newline="", encoding="utf-8")
+        fp   = os.path.join(d, f"thermal_{mode}_{ts}.csv")
+        self.csv_file       = open(fp, "w", newline="", encoding="utf-8")
+        self._csv_open_ts   = _time.time()
         hdr = ["timestamp", "tick_ms", "mq_raw", "max_temp_c",
                "hot_pixels", "fire_triggered", "ambient_c"]
         hdr += [f"t{i:03d}" for i in range(NPIX)]
@@ -750,12 +795,15 @@ class App:
         try:
             w = self.thermal_lbl.winfo_width()
             h = self.thermal_lbl.winfo_height()
+            # 위젯이 아직 렌더링되지 않은 경우 고정 기본값 사용
             if w < 32 or h < 32:
                 w, h = 320, 240
             self._th_photo = self._arr_to_photo(arr, w, h)
-            self.thermal_lbl.configure(image=self._th_photo)
-        except Exception:
-            pass
+            # image + width/height 동시 설정 → 이미지가 항상 widget을 꽉 채움
+            self.thermal_lbl.configure(image=self._th_photo,
+                                       width=w, height=h)
+        except Exception as e:
+            self._log(f"[render error] {e}", "warn")
 
         # 오버레이 정보 업데이트
         fps = d.get("fps_bin", 0)
@@ -783,7 +831,19 @@ class App:
         self.canvas_g.draw_idle()   # 그래프만 matplotlib
 
     def _save_csv(self, d: dict):
-        """CSV 한 행 저장"""
+        """CSV 한 행 저장 + 인터벌 파일 로테이션"""
+        if not self.csv_var.get():
+            return
+        # ── 인터벌 로테이션 확인 ─────────────────────────────────────────────
+        interval_str = self.csv_interval.get()
+        interval_sec = {"1분": 60, "5분": 300, "10분": 600,
+                        "30분": 1800, "60분": 3600}.get(interval_str, 0)
+        if interval_sec and self.csv_file:
+            elapsed = _time.time() - self._csv_open_ts
+            if elapsed >= interval_sec:
+                self._log(f"CSV 파일 분리 ({interval_str} 경과)", "info")
+                self._init_csv()        # 새 파일 시작
+
         if not self.csv_writer:
             return
         ambient = d.get("ambient", "")
