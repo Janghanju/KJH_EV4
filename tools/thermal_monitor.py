@@ -153,16 +153,8 @@ class App:
         self._btn(bar, "⟳ 새로고침", self._refresh_ports,
                   bg=PNL).pack(side=tk.LEFT, padx=(0, 6))
 
-        # ── 연결 모드 선택 ──────────────────────────────────────────────────
-        self._lb(bar, "모드:").pack(side=tk.LEFT, padx=(0, 3))
-        self.mode_var = tk.StringVar(value="자동 감지")
-        mode_menu = tk.OptionMenu(bar, self.mode_var,
-                                  "자동 감지", "GY-MCU90640 직접", "ESP32 릴레이")
-        mode_menu.configure(bg=PNL, fg=WHT, activebackground=ACC,
-                            font=("Helvetica", 9), relief="flat",
-                            highlightthickness=0, width=14)
-        mode_menu["menu"].configure(bg=PNL, fg=WHT)
-        mode_menu.pack(side=tk.LEFT, padx=(0, 8))
+        # ── 연결 모드 선택 (ESP32 릴레이 전용 — GY직접 모드는 별도 배선 필요) ──
+        self.mode_var = tk.StringVar(value="ESP32 릴레이")
 
         self.conn_btn = self._btn(bar, "▶  연결", self._toggle_connect, bg="#1a6b3a")
         self.conn_btn.pack(side=tk.LEFT, padx=(0, 8))
@@ -437,26 +429,23 @@ class App:
         self.frame_count = self.drop_count = self._fps_cnt = self.parse_fail = 0
         self._fps_ts = self._frame_t0 = _time.time()
 
-        # ── 모드 결정 ────────────────────────────────────────────────────────
+        # ── 모드 결정 (ESP32 릴레이 고정 또는 자동 감지) ────────────────────
         chosen = self.mode_var.get()
-        if chosen == "GY-MCU90640 직접":
-            self.binary_mode = True
-        elif chosen == "ESP32 릴레이":
-            self.binary_mode = False
-        else:
-            # 자동 감지: 첫 수신 바이트로 판단
+        if chosen == "자동 감지":
             self.ser.timeout = 0.5
             probe = self.ser.read(16)
             self.ser.timeout = 2.0
             non_print = sum(1 for b in probe if b < 32 and b not in (0x0A, 0x0D))
             self.binary_mode = (non_print >= 3)
             self._log(
-                f"자동 감지: {'바이너리(GY-MCU90640)' if self.binary_mode else '텍스트(ESP32)'} "
+                f"자동 감지: {'바이너리' if self.binary_mode else 'ESP32 텍스트'} "
                 f"[probe={probe.hex()}]", "info")
+        else:
+            self.binary_mode = False   # ESP32 릴레이
 
-        mode_label = "GY-MCU90640 직접" if self.binary_mode else "ESP32 릴레이"
+        mode_label = "ESP32 릴레이"
         self.conn_btn.configure(text="■  연결 해제", bg="#7b1c1c")
-        self.conn_lbl.configure(text=f"●  {port}  [{mode_label}]", fg=GRN)
+        self.conn_lbl.configure(text=f"●  {port}", fg=GRN)
         self._log(f"포트 연결: {port}  ({BAUD} baud)  모드={mode_label}", "info")
 
         if self.csv_var.get():
@@ -791,17 +780,15 @@ class App:
         arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
         r_max, c_max = divmod(int(arr.argmax()), COLS)
 
-        # ── 열화상: PIL PhotoImage (매우 빠름) ───────────────────────────────
+        # ── 열화상: PIL PhotoImage ─────────────────────────────────────────────
+        # configure(width=, height=)는 tkinter 레이아웃 피드백 루프 유발 → image만 설정
         try:
             w = self.thermal_lbl.winfo_width()
             h = self.thermal_lbl.winfo_height()
-            # 위젯이 아직 렌더링되지 않은 경우 고정 기본값 사용
             if w < 32 or h < 32:
                 w, h = 320, 240
             self._th_photo = self._arr_to_photo(arr, w, h)
-            # image + width/height 동시 설정 → 이미지가 항상 widget을 꽉 채움
-            self.thermal_lbl.configure(image=self._th_photo,
-                                       width=w, height=h)
+            self.thermal_lbl.configure(image=self._th_photo)
         except Exception as e:
             self._log(f"[render error] {e}", "warn")
 
@@ -891,19 +878,25 @@ class App:
         self.log.configure(state=tk.DISABLED)
 
     def on_close(self):
-        self._disconnect()
-        self.root.destroy()
+        try:
+            self._disconnect()
+        except Exception:
+            pass
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
 
 # ─── 진입점 ──────────────────────────────────────────────────────────────────
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="KJH_EV4 열화상 모니터")
-    ap.add_argument("--port",  default="",
+    ap.add_argument("--port", default="",
                     help="시리얼 포트 자동 연결 (예: /dev/cu.usbmodem...)")
-    ap.add_argument("--mode",  default="자동 감지",
-                    choices=["자동 감지", "GY-MCU90640 직접", "ESP32 릴레이"],
-                    help="연결 모드")
+    ap.add_argument("--mode", default="ESP32 릴레이",
+                    choices=["자동 감지", "ESP32 릴레이"],
+                    help="연결 모드 (기본: ESP32 릴레이)")
     args = ap.parse_args()
 
     print("KJH_EV4 열화상 모니터 시작 중...", flush=True)
