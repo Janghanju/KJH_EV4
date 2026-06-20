@@ -13,6 +13,7 @@ KJH_EV4 실시간 열화상 모니터 GUI  v3.0
 
 import csv
 import gc
+import glob
 import os
 import queue
 import subprocess
@@ -100,8 +101,8 @@ class App:
         # 런타임 상태
         self.ser          = None
         self.running      = False
-        self.binary_mode  = False   # True = GY-MCU90640 직접 바이너리, False = ESP32 텍스트
-        self.data_q       = queue.Queue(maxsize=30)
+        self.binary_mode  = False
+        self.data_q       = queue.Queue(maxsize=5)   # 과도한 버퍼링 방지 (was 30)
         self.csv_file     = None
         self.csv_writer   = None
         self.frame_count  = 0
@@ -109,31 +110,35 @@ class App:
         self.parse_fail   = 0
         self.last_fire    = False
         self._fps_cnt     = 0
-        self._fps_ts      = datetime.now().timestamp()
+        self._fps_ts      = _time.time()
         self._frame_t0    = _time.time()
-        self._last_render = 0.0
-        self._pending     = None    # 다음 캔버스 렌더 대기 데이터
-        self._th_photo    = None    # ImageTk.PhotoImage 단일 인스턴스 (재사용)
+        self._pending     = None
+        # PhotoImage 재사용 — 크기 바뀔 때만 새로 생성
+        self._th_photo    = None
         self._th_w        = 0
         self._th_h        = 0
         self._gc_ts       = _time.time()
 
-        # 그래프 히스토리
-        self.ht: list = []
-        self.htemp: list = []
-        self.hmq: list   = []
+        # 열화상 렌더 전용 pre-allocated 버퍼 (프레임마다 ndarray 재할당 방지)
+        self._norm_buf = np.zeros((ROWS, COLS), dtype=np.float32)
+
+        # 그래프 히스토리 (deque: maxlen이 자동 트림 — del 슬라이싱 불필요)
+        from collections import deque
+        self.ht    = deque(maxlen=MAX_HIST)
+        self.htemp = deque(maxlen=MAX_HIST)
+        self.hmq   = deque(maxlen=MAX_HIST)
 
         # CSV 저장 경로 / 로테이션
         self.save_dir       = tk.StringVar(value=DEFAULT_DIR)
         self.csv_interval   = tk.StringVar(value="없음")
         self._csv_open_ts   = 0.0
-        self._last_csv_ts   = 0.0    # 마지막 CSV 행 저장 시각 (1초 제한)
+        self._last_csv_ts   = 0.0
 
-        # 이미지 캡처 / 영상
-        self.cap_var        = tk.BooleanVar(value=True)   # 캡처 활성화 토글
-        self._cap_dir       = ""      # 캡처 JPEG 저장 경로
-        self._last_cap_ts   = 0.0    # 마지막 캡처 시각
-        self._cap_frames: list = []  # 영상용 PIL Image 버퍼 (최대 7200장)
+        # 이미지 캡처 (RAM에 PIL Image 보관 안 함 — 파일에만 저장)
+        self.cap_var      = tk.BooleanVar(value=True)
+        self._cap_dir     = ""
+        self._last_cap_ts = 0.0
+        self._cap_count   = 0   # 저장된 JPEG 개수 카운터만 유지
 
         # UI 구성 — 순서 중요: BOTTOM 요소를 먼저 pack
         self._build_log()        # pack BOTTOM 1st
@@ -270,46 +275,43 @@ class App:
         arr = np.full((ROWS, COLS), 25.0, dtype=np.float32)
         self._update_thermal_label(arr, 320, 240)
 
-    @staticmethod
-    def _arr_to_pil(arr: np.ndarray, width: int, height: int) -> "Image.Image":
-        """온도 배열 → PIL Image (inferno LUT, 가로 flip, bilinear 업스케일)
-        최대 640×480 캡 → 프레임당 메모리 상한 900KB 이하 보장
-        """
-        lo, hi = float(arr.min()), float(arr.max())
+    def _arr_to_pil(self, arr: np.ndarray, width: int, height: int) -> "Image.Image":
+        lo = float(arr.min()); hi = float(arr.max())
         if hi - lo < 1.0:
             lo -= 5.0; hi += 5.0
-        norm = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
-        norm = np.fliplr(norm)                         # 가로 flip (Test.py cv2.flip(img,1) 동일)
+        # _norm_buf: pre-allocated (24×32 float32) — 매 프레임 재할당 제거
+        np.clip((arr - lo) / (hi - lo), 0.0, 1.0, out=self._norm_buf)
+        norm = self._norm_buf[:, ::-1]   # fliplr as a zero-copy view
         if _INFERNO is not None:
-            rgba = _INFERNO(norm)
+            rgba = _INFERNO(norm)                            # (24,32,4) float64
             rgb  = (rgba[:, :, :3] * 255).astype(np.uint8)
         else:
             r = np.clip(norm * 2.5,       0, 1)
             g = np.clip(norm * 2.5 - 1.0, 0, 1)
             b = np.clip(1.0 - norm * 2.0, 0, 1)
             rgb = (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
-        # 최소 32px, 최대 1920×1080 가드 (창 크기에 자동 맞춤)
         w = max(32, min(width,  1920))
         h = max(32, min(height, 1080))
         return Image.fromarray(rgb).resize((w, h), Image.BILINEAR)
 
     def _update_thermal_label(self, arr: np.ndarray, w: int, h: int):
-        """열화상 Label 갱신 — 구 PhotoImage를 즉시 명시 삭제 후 신규 생성
-        tkinter PhotoImage는 Tcl 내부 참조를 유지하므로 Python GC만으론 부족.
-        label.configure(image=new) 직후 old.__del__() 호출로 Tcl 자원 즉시 해제.
-        """
         img = self._arr_to_pil(arr, w, h)
         iw, ih = img.size
-        old = self._th_photo
-        self._th_photo = ImageTk.PhotoImage(img)
-        self._th_w, self._th_h = iw, ih
-        self.thermal_lbl.configure(image=self._th_photo)
-        # label이 new_photo를 참조한 뒤 old 삭제 → Tcl 이미지 즉시 해제
-        if old is not None:
-            try:
-                old.__del__()
-            except Exception:
-                pass
+        if self._th_photo is not None and iw == self._th_w and ih == self._th_h:
+            # 크기 동일: PhotoImage를 재생성하지 않고 픽셀만 덮어씀
+            # → Tcl 리소스 alloc/dealloc 완전 제거 (매 250ms 할당 없음)
+            self._th_photo.paste(img)
+        else:
+            # 크기 변경 시에만 새 PhotoImage 생성
+            old = self._th_photo
+            self._th_photo = ImageTk.PhotoImage(img)
+            self._th_w, self._th_h = iw, ih
+            self.thermal_lbl.configure(image=self._th_photo)
+            if old is not None:
+                try:
+                    old.__del__()
+                except Exception:
+                    pass
 
     # ── 상태 패널 ────────────────────────────────────────────────────────────
     def _build_status(self, parent):
@@ -485,7 +487,6 @@ class App:
         if self.ser and self.ser.is_open:
             if self.binary_mode:
                 try:
-                    # GY-MCU90640 자동 전송 중지 명령
                     self.ser.write(bytes([0xA5, 0x35, 0x01, 0xDB]))
                 except Exception:
                     pass
@@ -493,6 +494,14 @@ class App:
         if self.csv_file:
             self.csv_file.close()
             self.csv_file = self.csv_writer = None
+        # 미처리 큐 비우기 + pending 참조 해제 → data dict 즉시 GC
+        while not self.data_q.empty():
+            try:
+                self.data_q.get_nowait()
+            except queue.Empty:
+                break
+        self._pending = None
+        gc.collect()
         self.conn_btn.configure(text="▶  연결", bg="#1a6b3a")
         self.conn_lbl.configure(text="●  연결 끊김", fg="#555555")
         self._log("포트 연결 해제", "warn")
@@ -580,15 +589,14 @@ class App:
                 frame = bytes([0x5A, 0x5A]) + rest
 
                 # ── 픽셀 온도 파싱 (bytes 4‥1539, int16 LE, ÷100 = °C) ──
-                raw_pix = frame[4:1540]
-                arr16   = np.frombuffer(raw_pix, dtype=np.int16)  # LE
-                pixels  = (arr16.astype(np.float32) / 100.0).tolist()
+                pixels = np.frombuffer(frame, dtype=np.int16,
+                                       count=NPIX, offset=4).astype(np.float32) / 100.0
 
                 # ── 주변 온도 (bytes 1540‥1541, int16 LE) ────────────────
-                ta = (int(frame[1540]) + int(frame[1541]) * 256) / 100.0
+                ta = int.from_bytes(frame[1540:1542], "little", signed=True) / 100.0
 
-                max_t  = float(max(pixels))
-                hot_px = sum(1 for p in pixels if p >= 45.0)
+                max_t  = float(pixels.max())
+                hot_px = int((pixels >= 45.0).sum())
                 now_t  = _time.time()
                 fps    = 1.0 / max(now_t - self._frame_t0, 0.001)
                 self._frame_t0 = now_t
@@ -682,16 +690,15 @@ class App:
             hex_blob = p[6].strip()
             if len(hex_blob) < NPIX * 4:
                 return None
-            raw   = bytes.fromhex(hex_blob[:NPIX * 4])
-            arr16 = np.frombuffer(raw, dtype=">i2")   # big-endian (MSB first)
-            pixels = (arr16.astype(np.float32) / 100.0).tolist()
+            raw    = bytes.fromhex(hex_blob[:NPIX * 4])
+            pixels = np.frombuffer(raw, dtype=">i2").astype(np.float32) / 100.0
             return {
                 "tick_ms":    int(p[1]),
                 "mq":         int(p[2]),
                 "max_temp":   int(p[3]) / 100.0,
                 "hot_pixels": int(p[4]),
                 "fire":       bool(int(p[5])),
-                "pixels":     pixels,
+                "pixels":     pixels,  # ndarray (768,) float32 — Python list 불필요
                 "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
             }
         except Exception:
@@ -704,14 +711,15 @@ class App:
         if len(p) < 6 + NPIX:
             return None
         try:
-            pixels = [float(x) for x in p[6: 6 + NPIX]]
+            pixels = np.fromiter((float(x) for x in p[6: 6 + NPIX]),
+                                 dtype=np.float32, count=NPIX)
             return {
                 "tick_ms":    int(p[1]),
                 "mq":         int(p[2]),
                 "max_temp":   float(p[3]),
                 "hot_pixels": int(p[4]),
                 "fire":       bool(int(p[5])),
-                "pixels":     pixels,
+                "pixels":     pixels,  # ndarray (768,) float32
                 "ts":         datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
             }
         except Exception:
@@ -750,9 +758,9 @@ class App:
                 self._fps_ts  = now_dt
 
             self.frame_lbl.configure(
-                text=f"프레임: {self.frame_count}  |  캡처: {len(self._cap_frames)}")
+                text=f"프레임: {self.frame_count}  |  캡처: {self._cap_count}")
 
-            if now_ts - self._gc_ts >= 5.0:
+            if now_ts - self._gc_ts >= 3.0:   # 3초마다 GC (was 5s)
                 gc.collect()
                 self._gc_ts = now_ts
                 self._trim_log()
@@ -765,12 +773,14 @@ class App:
             self.root.after(100, self._tick)
 
     def _thermal_tick(self):
-        """열화상 이미지 전용 루프 (250ms ≈ 4 FPS) — PIL 렌더만"""
+        """열화상 이미지 전용 루프 (250ms ≈ 4 FPS)"""
         try:
             d = self._pending
             if d is not None:
-                arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
-                r_max, c_max = divmod(int(arr.argmax()), COLS)
+                # pixels가 ndarray(768,)이면 reshape는 zero-copy view
+                arr = d["pixels"].reshape(ROWS, COLS)
+                hot_idx = int(arr.argmax())
+                r_max, c_max = divmod(hot_idx, COLS)
                 try:
                     w = self.thermal_lbl.winfo_width()
                     h = self.thermal_lbl.winfo_height()
@@ -789,24 +799,21 @@ class App:
             self.root.after(250, self._thermal_tick)
 
     def _graph_tick(self):
-        """matplotlib 그래프 전용 루프 (2000ms) — 무거운 렌더 분리"""
+        """matplotlib 그래프 전용 루프 (2000ms)"""
         try:
             d = self._pending
             if d is not None:
-                t = d["tick_ms"] / 1000.0
-                self.ht.append(t)
+                # deque(maxlen=MAX_HIST) — 자동 트림, 수동 del 불필요
+                self.ht.append(d["tick_ms"] / 1000.0)
                 self.htemp.append(d["max_temp"])
                 self.hmq.append(d["mq"])
-                for lst in (self.ht, self.htemp, self.hmq):
-                    if len(lst) > MAX_HIST:
-                        del lst[:-MAX_HIST]
-                self.ln_temp.set_data(self.ht, self.htemp)
-                self.ax_temp.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0]+1))
-                self.ax_temp.set_ylim(max(0, min(self.htemp)-5),
-                                      max(100, max(self.htemp)+5))
-                self.ln_mq.set_data(self.ht, self.hmq)
-                self.ax_mq.set_xlim(self.ht[0], max(self.ht[-1], self.ht[0]+1))
-                self.ax_mq.set_ylim(0, max(1500, max(self.hmq)+100))
+                ht = list(self.ht); htemp = list(self.htemp); hmq = list(self.hmq)
+                self.ln_temp.set_data(ht, htemp)
+                self.ax_temp.set_xlim(ht[0], max(ht[-1], ht[0]+1))
+                self.ax_temp.set_ylim(max(0, min(htemp)-5), max(100, max(htemp)+5))
+                self.ln_mq.set_data(ht, hmq)
+                self.ax_mq.set_xlim(ht[0], max(ht[-1], ht[0]+1))
+                self.ax_mq.set_ylim(0, max(1500, max(hmq)+100))
                 self.canvas_g.draw_idle()
         except Exception as e:
             try:
@@ -876,10 +883,16 @@ class App:
         if not self.csv_writer:
             return
         ambient = d.get("ambient", "")
+        pix = d["pixels"]
+        # ndarray이면 numpy 벡터 포맷 (list comp 768회 f-string보다 빠름)
+        if isinstance(pix, np.ndarray):
+            pix_strs = list(np.char.mod("%.2f", pix))
+        else:
+            pix_strs = [f"{v:.2f}" for v in pix]
         row = [d["ts"], d["tick_ms"], d["mq"],
                f"{d['max_temp']:.2f}", d["hot_pixels"], int(d["fire"]),
                f"{ambient:.2f}" if ambient != "" else ""]
-        row += [f"{v:.2f}" for v in d["pixels"]]
+        row += pix_strs
         try:
             self.csv_writer.writerow(row)
             self.csv_file.flush()
@@ -887,7 +900,7 @@ class App:
             self._log(f"[CSV error] {e}", "warn")
 
     def _capture_frame(self, d: dict):
-        """1초마다 열화상 JPEG 캡처 + 영상용 버퍼 보관"""
+        """1초마다 열화상 JPEG를 디스크에만 저장 (RAM에 PIL Image 누적 없음)"""
         if not self.cap_var.get() or not self._cap_dir:
             return
         now = _time.time()
@@ -895,56 +908,58 @@ class App:
             return
         self._last_cap_ts = now
         try:
-            arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
-            img = self._arr_to_pil(arr, 320, 240)
-            ts  = datetime.now().strftime("%Y%m%d_%H%M%S")
+            arr  = d["pixels"].reshape(ROWS, COLS)   # ndarray → zero-copy view
+            img  = self._arr_to_pil(arr, 320, 240)
+            ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
             fname = os.path.join(self._cap_dir, f"frame_{ts}.jpg")
             img.save(fname, "JPEG", quality=85)
-            # 영상용 버퍼 (최대 7200장 = 2시간 @ 1fps)
-            if len(self._cap_frames) < 7200:
-                self._cap_frames.append(img.copy())
+            # img 즉시 버리고 카운터만 올림 → PIL Image가 RAM에 남지 않음
+            self._cap_count += 1
         except Exception as e:
             self._log(f"[capture error] {e}", "warn")
 
     def _save_video(self):
-        """캡처 프레임으로 MP4 영상 생성"""
-        if not self._cap_frames:
+        """캡처 JPEG 파일을 디스크에서 읽어 MP4 생성 (RAM 버퍼 없음)"""
+        frame_dir = self._cap_dir
+        if not frame_dir or not os.path.isdir(frame_dir):
             messagebox.showinfo("캡처 없음",
-                "캡처된 프레임이 없습니다.\n연결 후 '📸 이미지 캡처'를 활성화하세요.")
+                "캡처 폴더가 없습니다.\n연결 후 '📸 이미지 캡처'를 활성화하세요.")
             return
-        d  = self.save_dir.get()
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        frames = sorted(glob.glob(os.path.join(frame_dir, "frame_*.jpg")))
+        if not frames:
+            messagebox.showinfo("캡처 없음", f"저장된 프레임이 없습니다.\n{frame_dir}")
+            return
+        d     = self.save_dir.get()
+        ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
         os.makedirs(d, exist_ok=True)
         vpath = os.path.join(d, f"thermal_timelapse_{ts}.mp4")
+        n     = len(frames)
         try:
             import imageio
-            writer = imageio.get_writer(vpath, fps=4, quality=7)
-            for img in self._cap_frames:
-                writer.append_data(np.array(img))
-            writer.close()
-            self._log(f"영상 저장 완료: {vpath}  ({len(self._cap_frames)}프레임)", "info")
-            messagebox.showinfo("영상 저장", f"저장 완료:\n{vpath}")
+            # 프레임을 한 장씩 디스크에서 읽어 인코딩 → RAM에 전체 버퍼 없음
+            with imageio.get_writer(vpath, fps=1, quality=7) as writer:
+                for fp in frames:
+                    writer.append_data(np.array(Image.open(fp)))
+            self._log(f"영상 저장 완료: {vpath}  ({n}프레임)", "info")
+            messagebox.showinfo("영상 저장", f"저장 완료 ({n}프레임):\n{vpath}")
         except ImportError:
-            # ffmpeg fallback
             try:
-                import subprocess
-                frame_dir = self._cap_dir or d
                 result = subprocess.run(
                     ["ffmpeg", "-y", "-framerate", "1",
                      "-pattern_type", "glob", "-i",
                      os.path.join(frame_dir, "frame_*.jpg"),
                      "-c:v", "libx264", "-pix_fmt", "yuv420p", vpath],
-                    capture_output=True, text=True, timeout=60)
+                    capture_output=True, text=True, timeout=120)
                 if result.returncode == 0:
-                    self._log(f"영상 저장(ffmpeg): {vpath}", "info")
-                    messagebox.showinfo("영상 저장", f"저장 완료:\n{vpath}")
+                    self._log(f"영상 저장(ffmpeg): {vpath}  ({n}프레임)", "info")
+                    messagebox.showinfo("영상 저장", f"저장 완료 ({n}프레임):\n{vpath}")
                 else:
-                    raise RuntimeError(result.stderr[:200])
+                    raise RuntimeError(result.stderr[-300:])
             except Exception as e:
-                self._log(f"[video error] imageio 미설치, ffmpeg 실패: {e}", "warn")
+                self._log(f"[video error] {e}", "warn")
                 messagebox.showwarning("영상 저장 실패",
                     "imageio 패키지 필요:\n  pip install imageio[ffmpeg]\n\n"
-                    f"JPEG 프레임은 {self._cap_dir} 에 저장되어 있습니다.")
+                    f"JPEG 프레임 위치: {frame_dir}")
 
     # =========================================================================
     # 유틸
@@ -974,8 +989,8 @@ class App:
         self.log.see(tk.END)
         self.log.configure(state=tk.DISABLED)
 
-    def _trim_log(self, max_lines: int = 300):
-        """로그 패널 300줄 초과 시 앞부분 삭제 (메모리 누수 방지)"""
+    def _trim_log(self, max_lines: int = 200):
+        """로그 패널 200줄 초과 시 앞부분 삭제"""
         try:
             lines = int(self.log.index("end-1c").split(".")[0])
             if lines > max_lines:
