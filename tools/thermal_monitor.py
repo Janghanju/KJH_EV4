@@ -12,6 +12,7 @@ KJH_EV4 실시간 열화상 모니터 GUI  v3.0
 """
 
 import csv
+import gc
 import os
 import queue
 import subprocess
@@ -110,8 +111,12 @@ class App:
         self._fps_cnt     = 0
         self._fps_ts      = datetime.now().timestamp()
         self._frame_t0    = _time.time()
-        self._last_render = 0.0     # matplotlib 렌더 타임스탬프 (쓰로틀용)
+        self._last_render = 0.0
         self._pending     = None    # 다음 캔버스 렌더 대기 데이터
+        self._th_photo    = None    # ImageTk.PhotoImage 단일 인스턴스 (재사용)
+        self._th_w        = 0       # 현재 PhotoImage 너비 (크기 변경 시만 재생성)
+        self._th_h        = 0
+        self._gc_ts       = _time.time()  # 마지막 gc.collect() 시각
 
         # 그래프 히스토리
         self.ht: list = []
@@ -225,12 +230,11 @@ class App:
         self._lb(parent, "MLX90640 열화상  (32 × 24 → 320 × 240)",
                  size=11, color=CYN, bold=True).pack(pady=(0, 4))
 
-        # 열화상 이미지 표시용 Label (PIL PhotoImage)
-        self._th_photo  = None          # 가비지컬렉션 방지용 레퍼런스
-        self.thermal_lbl = tk.Label(parent, bg=BG, cursor="crosshair",
-                                    anchor="nw")   # 이미지 좌상단 고정 (shift 방지)
+        # 열화상 이미지 표시용 Label
+        # ※ <Configure> 바인딩 금지 — configure(image=) 호출이 이벤트를 재발화해
+        #   무한루프로 ImageTk.PhotoImage가 수십GB까지 누적되는 치명적 메모리 누수 유발
+        self.thermal_lbl = tk.Label(parent, bg=BG, cursor="crosshair", anchor="nw")
         self.thermal_lbl.pack(fill=tk.BOTH, expand=True)
-        self.thermal_lbl.bind("<Configure>", self._on_thermal_resize)
 
         # 오버레이 정보 바 (최고온도 + FPS)
         info_bar = tk.Frame(parent, bg=DRK, pady=3)
@@ -244,46 +248,50 @@ class App:
         self._draw_placeholder()
 
     def _draw_placeholder(self):
-        """연결 전 표시할 기본 열화상 이미지"""
+        """연결 전 placeholder 렌더"""
         arr = np.full((ROWS, COLS), 25.0, dtype=np.float32)
-        self._th_photo = self._arr_to_photo(arr)
-        self.thermal_lbl.configure(image=self._th_photo)
-
-    def _on_thermal_resize(self, event):
-        """위젯 크기 변경 시 보류 중인 프레임으로 즉시 재렌더"""
-        if self._pending is not None:
-            d = self._pending
-            arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
-            w, h = max(event.width, 32), max(event.height, 32)
-            self._th_photo = self._arr_to_photo(arr, w, h)
-            self.thermal_lbl.configure(image=self._th_photo)
+        self._update_thermal_label(arr, 320, 240)
 
     @staticmethod
-    def _arr_to_photo(arr: np.ndarray, width: int = 320, height: int = 240):
-        """온도 배열 → PIL PhotoImage
-        - 실제 matplotlib inferno LUT (256색 정확도)
-        - 가로 flip: 참조 코드(Test.py) cv2.flip(img,1) 동일 처리
-        - bicubic 업스케일
+    def _arr_to_pil(arr: np.ndarray, width: int, height: int) -> "Image.Image":
+        """온도 배열 → PIL Image (inferno LUT, 가로 flip, bilinear 업스케일)
+        최대 640×480 캡 → 프레임당 메모리 상한 900KB 이하 보장
         """
         lo, hi = float(arr.min()), float(arr.max())
         if hi - lo < 1.0:
             lo -= 5.0; hi += 5.0
         norm = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
-        norm = np.fliplr(norm)                    # 가로 flip (참조코드와 동일)
-
+        norm = np.fliplr(norm)                         # 가로 flip (Test.py cv2.flip(img,1) 동일)
         if _INFERNO is not None:
-            rgba = _INFERNO(norm)                 # (H, W, 4) float64
+            rgba = _INFERNO(norm)
             rgb  = (rgba[:, :, :3] * 255).astype(np.uint8)
         else:
-            # fallback: 단순 근사
             r = np.clip(norm * 2.5,       0, 1)
             g = np.clip(norm * 2.5 - 1.0, 0, 1)
             b = np.clip(1.0 - norm * 2.0, 0, 1)
             rgb = (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
+        # 해상도 상한 640×480 (1MB 이내)
+        w = min(width,  640)
+        h = min(height, 480)
+        return Image.fromarray(rgb).resize((w, h), Image.BILINEAR)
 
-        img = Image.fromarray(rgb)
-        img = img.resize((width, height), Image.BICUBIC)
-        return ImageTk.PhotoImage(img)
+    def _update_thermal_label(self, arr: np.ndarray, w: int, h: int):
+        """열화상 Label 갱신 — 구 PhotoImage를 즉시 명시 삭제 후 신규 생성
+        tkinter PhotoImage는 Tcl 내부 참조를 유지하므로 Python GC만으론 부족.
+        label.configure(image=new) 직후 old.__del__() 호출로 Tcl 자원 즉시 해제.
+        """
+        img = self._arr_to_pil(arr, w, h)
+        iw, ih = img.size
+        old = self._th_photo
+        self._th_photo = ImageTk.PhotoImage(img)
+        self._th_w, self._th_h = iw, ih
+        self.thermal_lbl.configure(image=self._th_photo)
+        # label이 new_photo를 참조한 뒤 old 삭제 → Tcl 이미지 즉시 해제
+        if old is not None:
+            try:
+                old.__del__()
+            except Exception:
+                pass
 
     # ── 상태 패널 ────────────────────────────────────────────────────────────
     def _build_status(self, parent):
@@ -716,6 +724,13 @@ class App:
 
             self.frame_lbl.configure(
                 text=f"프레임: {self.frame_count}  |  드롭: {self.drop_count}")
+
+            # 5초마다 GC 강제 실행 + 로그 패널 트리밍 (300줄 상한)
+            now_t = _time.time()
+            if now_t - self._gc_ts >= 5.0:
+                gc.collect()
+                self._gc_ts = now_t
+                self._trim_log()
         except Exception as e:
             try:
                 self._log(f"[tick error] {e}", "warn")
@@ -725,7 +740,7 @@ class App:
             self.root.after(200, self._tick)
 
     def _draw_tick(self):
-        """matplotlib 렌더 전용 루프 (500ms) — CPU 과부하 방지"""
+        """matplotlib 렌더 전용 루프 (1000ms) — 그래프 초당 1회 갱신"""
         try:
             d = self._pending
             if d is not None:
@@ -737,7 +752,7 @@ class App:
             except Exception:
                 pass
         finally:
-            self.root.after(500, self._draw_tick)
+            self.root.after(1000, self._draw_tick)
 
     def _update_labels(self, d: dict):
         """빠른 tkinter 위젯 갱신 (matplotlib 렌더 없음)"""
@@ -780,15 +795,13 @@ class App:
         arr = np.array(d["pixels"], dtype=np.float32).reshape(ROWS, COLS)
         r_max, c_max = divmod(int(arr.argmax()), COLS)
 
-        # ── 열화상: PIL PhotoImage ─────────────────────────────────────────────
-        # configure(width=, height=)는 tkinter 레이아웃 피드백 루프 유발 → image만 설정
+        # ── 열화상: in-place PhotoImage 업데이트 ─────────────────────────────
         try:
             w = self.thermal_lbl.winfo_width()
             h = self.thermal_lbl.winfo_height()
             if w < 32 or h < 32:
                 w, h = 320, 240
-            self._th_photo = self._arr_to_photo(arr, w, h)
-            self.thermal_lbl.configure(image=self._th_photo)
+            self._update_thermal_label(arr, w, h)
         except Exception as e:
             self._log(f"[render error] {e}", "warn")
 
@@ -871,6 +884,17 @@ class App:
         self.log.insert(tk.END, f"[{ts}] {msg}\n", tag or ())
         self.log.see(tk.END)
         self.log.configure(state=tk.DISABLED)
+
+    def _trim_log(self, max_lines: int = 300):
+        """로그 패널 300줄 초과 시 앞부분 삭제 (메모리 누수 방지)"""
+        try:
+            lines = int(self.log.index("end-1c").split(".")[0])
+            if lines > max_lines:
+                self.log.configure(state=tk.NORMAL)
+                self.log.delete("1.0", f"{lines - max_lines}.0")
+                self.log.configure(state=tk.DISABLED)
+        except Exception:
+            pass
 
     def _clear_log(self):
         self.log.configure(state=tk.NORMAL)
