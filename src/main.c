@@ -17,9 +17,9 @@
 #define PIN_COOLING_PUMP 8     // [출력] 소화수 펌프/릴레이 제어 핀
 
 #define UART_PORT_NUM UART_NUM_2
-#define PIN_UART_RX 17 // GY-MCU90640 모듈 TX (ESP32-S3 RX2)
-#define PIN_UART_TX 18 // GY-MCU90640 모듈 RX (ESP32-S3 TX2)
-#define UART_BUF_SIZE 4096   // 1544×2=3088 바이트 이상 확보 (4Hz 버퍼 여유)
+#define PIN_UART_RX 17     // GY-MCU90640 모듈 TX (ESP32-S3 RX2)
+#define PIN_UART_TX 18     // GY-MCU90640 모듈 RX (ESP32-S3 TX2)
+#define UART_BUF_SIZE 4096 // 1544×2=3088 바이트 이상 확보 (4Hz 버퍼 여유)
 
 #define ADC_MQ_CHANNEL ADC_CHANNEL_6 // GPIO 7번 (ADC1 단독 사용)
 
@@ -27,7 +27,7 @@
  * [2] 알고리즘 제어 매개변수 및 임계값 설정
  * ========================================================================= */
 #define MOTOR_PULSES_PER_REV 800 // TB6600 하드웨어 세팅 값
-#define MOTOR_TARGET_REV 20.0    // 방수포 기구부 유효 이동 거리 (20바퀴)
+#define MOTOR_TARGET_REV 15.0    // 방수포 기구부 유효 이동 거리 (20바퀴)
 #define MOTOR_PULSE_DELAY_US 400 // 스텝 모터 기동 주파수 (고속 복귀 세팅)
 
 #define BUTTON_RESET_HOLD_MS 3000 // 상단 원점 강제 복귀를 위한 롱프레스 판정 시간
@@ -51,6 +51,7 @@ volatile int mq_raw_value = 0;
 volatile int high_temp_pixel_count = 0;
 volatile float max_temp = 0.0f;
 volatile bool hybrid_fire_triggered = false;
+volatile bool fire_response_done    = false; // 리프트 올린 후 버튼으로 내리기 전까지 재감지 무시
 
 adc_oneshot_unit_handle_t adc1_handle;
 int32_t max_target_steps = 0;
@@ -79,9 +80,9 @@ void init_uart_module(void) {
 
     // GY-MCU90640 정확한 초기화 명령 (체크섬 = 하위바이트 합계)
     // 이전 코드 {0xA5,0x15,0xBA}는 존재하지 않는 명령 → 센서 미응답(모든 픽셀 fallback 24°C)
-    uint8_t cmd_set_4hz[]  = {0xA5, 0x25, 0x01, 0xCB};  // 프레임 주기 4Hz 설정
+    uint8_t cmd_set_4hz[] = {0xA5, 0x25, 0x01, 0xCB};    // 프레임 주기 4Hz 설정
     uint8_t cmd_start_auto[] = {0xA5, 0x35, 0x02, 0xDC}; // 자동 연속 스트리밍 시작
-    uart_write_bytes(UART_PORT_NUM, (const char *)cmd_set_4hz,   sizeof(cmd_set_4hz));
+    uart_write_bytes(UART_PORT_NUM, (const char *)cmd_set_4hz, sizeof(cmd_set_4hz));
     vTaskDelay(pdMS_TO_TICKS(120));
     uart_write_bytes(UART_PORT_NUM, (const char *)cmd_start_auto, sizeof(cmd_start_auto));
     ESP_LOGI(TAG, "GY-MCU90640 4Hz 자동 스트리밍 시작 (0xA5 0x25 0x01 / 0xA5 0x35 0x02).");
@@ -258,15 +259,14 @@ void vTaskEmergencyMonitor(void *pvParameters) {
         // -----------------------------------------------------------------
         // [A] 고전압 배터리 화재 트리거 시 무제한 순환 침수 소화 분기
         // -----------------------------------------------------------------
-        if (is_fire_detected) {
+        // fire_response_done: 리프트를 한 번 올린 뒤에는 버튼으로 내리기 전까지 재감지 무시
+        if (is_fire_detected && !fire_response_done) {
             ESP_LOGE(TAG, "[🔥 EMERGENCY] 배터리 팩 열폭주 감지! 즉시 비상 복귀 동작 개시!!");
 
-            // 하강 완료 상태이거나 중간에 걸친 발자취 스텝이 있다면 그만큼 복귀 연산
             int32_t run_steps = (actual_moved_steps > 0) ? actual_moved_steps : max_target_steps;
-
-            // move_emergency_return 내부에서 1/3 지점 도달 시 펌프 자동 기동
             move_emergency_return(run_steps);
 
+            fire_response_done   = true;   // 이후 반복 감지 무시 — 버튼 누를 때 해제
             needs_position_reset = true;
             ESP_LOGW(TAG, "[!] 화재 전개(%ld 스텝) 완료 -> 펌프 순환 유지, 버튼 입력 시 원위치 복귀", run_steps);
 
@@ -274,14 +274,13 @@ void vTaskEmergencyMonitor(void *pvParameters) {
             current_state = STATE_READY_REVERSE;
             vTaskDelay(pdMS_TO_TICKS(100));
 
-            // 화재 해제까지 펌프 ON 유지 (리프트 내려가기 전까지 계속 가동)
+            // 화재 해제까지 펌프 ON 유지
             while (hybrid_fire_triggered) {
                 asm volatile("memw");
                 ESP_LOGW(TAG, "[🔄 RECIRCULATING] 방수포 수조 내 순환 냉각 구동 중... (배터리 안정화 대기)");
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
 
-            // 화재 해제 후에도 펌프 ON 유지 → 버튼으로 리프트 하강 시작 즉시 move_forward_return 내부에서 차단
             ESP_LOGI(TAG, "[✔ SAFE] 화재 시그널 해제 -> 펌프 유지, 버튼으로 원위치 복귀 대기");
         }
 
@@ -299,9 +298,10 @@ void vTaskEmergencyMonitor(void *pvParameters) {
                         // move_forward_return 내부에서 펌프 즉시 차단 후 복귀
                         move_forward_return(max_target_steps);
 
-                        actual_moved_steps = 0;
-                        current_state = STATE_READY_REVERSE;
+                        actual_moved_steps   = 0;
+                        current_state        = STATE_READY_REVERSE;
                         needs_position_reset = false;
+                        fire_response_done   = false; // 원위치 복귀 완료 → 다음 화재 감지 정상 동작
                         continue;
                     }
 
@@ -353,7 +353,7 @@ void vTaskSensorAndImageProcessing(void *pvParameters) {
         adc_oneshot_read(adc1_handle, ADC_MQ_CHANNEL, &temp_mq);
         mq_raw_value = temp_mq;
 
-        // 가열 테스트 사양 (40도 / MQ 300 이상) 완전 하향 세팅 고정
+        // 가열 테스트 사양 (75도 / MQ 1200 이상) 완전 하향 세팅 고정
         float current_temp_threshold = TEMP_FIRE_PIXEL;
         int current_area_threshold = FIRE_MIN_AREA_PIXELS;
 
@@ -449,7 +449,7 @@ void vTaskSensorAndImageProcessing(void *pvParameters) {
         }
         printf("\n");
 
-        vTaskDelay(pdMS_TO_TICKS(250));  // 4Hz 센서 주기(250ms) 에 맞춘 폴링
+        vTaskDelay(pdMS_TO_TICKS(250)); // 4Hz 센서 주기(250ms) 에 맞춘 폴링
     }
 }
 
